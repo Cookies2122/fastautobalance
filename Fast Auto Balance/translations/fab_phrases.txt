@@ -1,0 +1,18 @@
+"Phrases"
+{
+	"FAB_Chat_T"    
+	{
+		"en"		"{BLUE}[FAB] {DEFAULT}You were transferred to the team {RED}Terrorists {DEFAULT}for balance"
+		"ru"		"{BLUE}[FAB] {DEFAULT}Вас перекинуло в команду {RED}Террористов {DEFAULT}для баланса"
+	}
+	"FAB_Chat_CT"    
+	{
+		"en"		"{BLUE}[FAB] {DEFAULT}You were transferred to the team {RED}Counter-Terrorists {DEFAULT}for balance"
+		"ru"		"{BLUE}[FAB] {DEFAULT}Вас перекинуло в команду {RED}Контр-Террористов {DEFAULT}для баланса"
+	}
+	"FAB_Block"    
+	{
+		"en"		"{BLUE}[FAB] {DEFAULT}You cannot switch to this team, the difference is too big!"
+		"ru"		"{BLUE}[FAB] {DEFAULT}Вы не можете перейти в эту команду, разница слишком большая!"
+	}
+}
