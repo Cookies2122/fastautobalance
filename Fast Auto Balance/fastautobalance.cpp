@@ -14,18 +14,16 @@ IFileSystem* filesystem = nullptr;
 
 std::map<std::string, std::string> g_Phrases;
 
-// Основные настройки
 int g_iMaxAD = 2;
 int g_iBlock = 1;
 bool g_bShowMsg = true;
+bool g_bDebug = false;
 
-// Админ настройки
 bool g_bAdminImmune = true;
 std::string g_sAdminFlag = "@admin/balance";
 int g_iAdminMax = 3;
 int g_iAdminBlock = 2;
 
-// VIP настройки
 bool g_bVIPImmune = true;
 std::vector<std::string> g_vecVIPGroups;
 int g_iVIPMax = 3;
@@ -34,16 +32,14 @@ int g_iVIPBlock = 2;
 int g_iTeam[64] = {0};
 bool g_bChangingTeam[64] = {false};
 
-// ✅ НОВОЕ: Список игроков на перенос
 struct PendingBalance {
-	int targetTeam;    // В какую команду переносить (2=T, 3=CT)
-	int deathTeam;     // В какой команде умер
-	int deathRound;    // В каком раунде умер
+	int targetTeam;
+	int deathTeam;
+	int deathRound;
 };
 std::map<int, PendingBalance> g_PendingBalance;
 int g_iCurrentRound = 0;
 
-// ✅ ЛОГИРОВАНИЕ В ФАЙЛ
 void LogFAB(const char* format, ...)
 {
 	if (!g_pUtils) return;
@@ -54,7 +50,6 @@ void LogFAB(const char* format, ...)
 	vsnprintf(buffer, sizeof(buffer), format, args);
 	va_end(args);
 	
-	// LogToFile сама добавляет .txt
 	g_pUtils->LogToFile("FAB", "%s", buffer);
 }
 
@@ -176,6 +171,7 @@ void LoadConfig()
 	g_iMaxAD = kv->GetInt("MaxAD", 2);
 	g_iBlock = kv->GetInt("block", 1);
 	g_bShowMsg = kv->GetBool("msg", true);
+	g_bDebug = kv->GetBool("debug", false);
 	
 	g_bAdminImmune = kv->GetBool("admin_imune", true);
 	g_sAdminFlag = kv->GetString("admin_flags", "@admin/balance");
@@ -194,26 +190,28 @@ void LoadConfig()
 	
 	delete kv;
 	
-	Msg("[FAB] Config loaded: MaxAD=%d, Block=%d, AdminMax=%d, AdminBlock=%d, VIPMax=%d, VIPBlock=%d\n", 
-		g_iMaxAD, g_iBlock, g_iAdminMax, g_iAdminBlock, g_iVIPMax, g_iVIPBlock);
+	Msg("[FAB] Config loaded: MaxAD=%d, Block=%d, AdminMax=%d, AdminBlock=%d, VIPMax=%d, VIPBlock=%d, Debug=%s\n", 
+		g_iMaxAD, g_iBlock, g_iAdminMax, g_iAdminBlock, g_iVIPMax, g_iVIPBlock, g_bDebug ? "ON" : "OFF");
 	
-	// ✅ ЛОГ КОНФИГА с правильным отображением VIP групп
-	std::string vipGroupsStr = "all";
-	if (!g_vecVIPGroups.empty())
+	if (g_bDebug)
 	{
-		vipGroupsStr = "";
-		for (size_t i = 0; i < g_vecVIPGroups.size(); i++)
+		std::string vipGroupsStr = "all";
+		if (!g_vecVIPGroups.empty())
 		{
-			if (i > 0) vipGroupsStr += ",";
-			vipGroupsStr += g_vecVIPGroups[i];
+			vipGroupsStr = "";
+			for (size_t i = 0; i < g_vecVIPGroups.size(); i++)
+			{
+				if (i > 0) vipGroupsStr += ",";
+				vipGroupsStr += g_vecVIPGroups[i];
+			}
 		}
+		
+		LogFAB("[CONFIG] MaxAD=%d block=%d msg=%d debug=%d | Admin: imune=%d max=%d block=%d flags=%s | VIP: imune=%d max=%d block=%d groups=%s",
+			g_iMaxAD, g_iBlock, g_bShowMsg, g_bDebug,
+			g_bAdminImmune, g_iAdminMax, g_iAdminBlock, g_sAdminFlag.c_str(),
+			g_bVIPImmune, g_iVIPMax, g_iVIPBlock, 
+			vipGroupsStr.c_str());
 	}
-	
-	LogFAB("[CONFIG] MaxAD=%d block=%d msg=%d | Admin: imune=%d max=%d block=%d flags=%s | VIP: imune=%d max=%d block=%d groups=%s",
-		g_iMaxAD, g_iBlock, g_bShowMsg,
-		g_bAdminImmune, g_iAdminMax, g_iAdminBlock, g_sAdminFlag.c_str(),
-		g_bVIPImmune, g_iVIPMax, g_iVIPBlock, 
-		vipGroupsStr.c_str());
 }
 
 void OnPlayerTeamPre(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
@@ -230,44 +228,40 @@ void OnPlayerTeamPre(const char* szName, IGameEvent* pEvent, bool bDontBroadcast
 	if (disconnect) return;
 	if (newTeam <= 1 || oldTeam <= 1) return;
 	if (newTeam == oldTeam) return;
-	
-	// Если это автобаланс - пропускаем
+
 	if (g_bChangingTeam[slot])
 	{
 		g_bChangingTeam[slot] = false;
 		return;
 	}
-	
-	// Считаем команды БЕЗ этого игрока (он еще в старой команде)
+
 	int t, ct;
 	GetCounts(t, ct, slot);
-	
-	// Добавляем игрока в новую команду для подсчета
+
 	if (newTeam == 2) t++;
 	else if (newTeam == 3) ct++;
 	
 	int diff = abs(t - ct);
 	int maxDiff = g_iBlock;
 	
-	// Определяем лимит для игрока
 	if (HasAdminPermission(slot))
 		maxDiff = g_iAdminBlock;
 	else if (HasVIPImmunity(slot))
 		maxDiff = g_iVIPBlock;
 	
-	// Проверяем дисбаланс
 	if (diff > maxDiff)
 	{
-		// БЛОКИРУЕМ переход
 		g_pPlayers->SwitchTeam(slot, oldTeam);
 		
-		// ✅ ЛОГ БЛОКИРОВКИ
-		const char* playerName = g_pPlayers->GetPlayerName(slot);
-		LogFAB("[BLOCK] slot %d (%s) tried %s->%s | Would be T=%d CT=%d diff=%d > maxDiff=%d | BLOCKED",
-			slot, playerName ? playerName : "Unknown",
-			oldTeam == 2 ? "T" : "CT",
-			newTeam == 2 ? "T" : "CT",
-			t, ct, diff, maxDiff);
+		if (g_bDebug)
+		{
+			const char* playerName = g_pPlayers->GetPlayerName(slot);
+			LogFAB("[BLOCK] slot %d (%s) tried %s->%s | Would be T=%d CT=%d diff=%d > maxDiff=%d | BLOCKED",
+				slot, playerName ? playerName : "Unknown",
+				oldTeam == 2 ? "T" : "CT",
+				newTeam == 2 ? "T" : "CT",
+				t, ct, diff, maxDiff);
+		}
 		
 		if (g_bShowMsg)
 		{
@@ -275,9 +269,8 @@ void OnPlayerTeamPre(const char* szName, IGameEvent* pEvent, bool bDontBroadcast
 			g_pUtils->PrintToChat(slot, " %s", msg);
 		}
 	}
-	else
+	else if (g_bDebug)
 	{
-		// ✅ ЛОГ РАЗРЕШЕНИЯ
 		const char* playerName = g_pPlayers->GetPlayerName(slot);
 		LogFAB("[ALLOW] slot %d (%s) switch %s->%s | Will be T=%d CT=%d diff=%d <= maxDiff=%d | ALLOWED",
 			slot, playerName ? playerName : "Unknown",
@@ -295,7 +288,6 @@ void OnPlayerTeam(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 	if (slot >= 0 && slot < 64) g_iTeam[slot] = team;
 }
 
-// ✅ НОВОЕ: При смерти ПОМЕЧАЕМ для переноса
 void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 {
 	if (!pEvent || !g_pPlayers || !g_pUtils) return;
@@ -307,75 +299,77 @@ void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 	int team = g_iTeam[slot];
 	if (team <= 1) return;
 	
-	// ✅ Считаем БЕЗ умершего
 	int t, ct;
 	GetCounts(t, ct, slot);
 	
-	// Определяем лимит для игрока
 	int maxDiff = g_iMaxAD;
 	if (HasAdminPermission(slot))
 		maxDiff = g_iAdminMax;
 	else if (HasVIPImmunity(slot))
 		maxDiff = g_iVIPMax;
 	
-	// ✅ Проверяем нужен ли баланс
 	if (t > ct && (t - ct) > maxDiff && team == 2)
 	{
-		// ✅ ЗАЩИТА: Не помечать если создаст пустую команду
 		if (t <= 1)
 		{
-			const char* playerName = g_pPlayers->GetPlayerName(slot);
-			LogFAB("[DEATH] slot %d (%s) died in T | T=%d CT=%d | SAFETY: Would create empty T team | NOT marked",
-				slot, playerName ? playerName : "Unknown", t, ct);
+			if (g_bDebug)
+			{
+				const char* playerName = g_pPlayers->GetPlayerName(slot);
+				LogFAB("[DEATH] slot %d (%s) died in T | T=%d CT=%d | SAFETY: Would create empty T team | NOT marked",
+					slot, playerName ? playerName : "Unknown", t, ct);
+			}
 			return;
 		}
 		
-		// ПОМЕЧАЕМ для переноса T → CT
 		PendingBalance pending;
-		pending.targetTeam = 3;  // CT
-		pending.deathTeam = 2;   // Умер в T
+		pending.targetTeam = 3;
+		pending.deathTeam = 2;
 		pending.deathRound = g_iCurrentRound;
 		g_PendingBalance[slot] = pending;
 		
-		// ✅ ЛОГ ПОМЕТКИ
-		const char* playerName = g_pPlayers->GetPlayerName(slot);
-		const char* playerType = HasAdminPermission(slot) ? "Admin" : (HasVIPImmunity(slot) ? "VIP" : "Player");
-		LogFAB("[DEATH] slot %d (%s) %s died in T | T=%d CT=%d diff=%d > maxDiff=%d | MARKED for CT (round %d)",
-			slot, playerName ? playerName : "Unknown", playerType,
-			t, ct, abs(t - ct), maxDiff, g_iCurrentRound);
+		if (g_bDebug)
+		{
+			const char* playerName = g_pPlayers->GetPlayerName(slot);
+			const char* playerType = HasAdminPermission(slot) ? "Admin" : (HasVIPImmunity(slot) ? "VIP" : "Player");
+			LogFAB("[DEATH] slot %d (%s) %s died in T | T=%d CT=%d diff=%d > maxDiff=%d | MARKED for CT (round %d)",
+				slot, playerName ? playerName : "Unknown", playerType,
+				t, ct, abs(t - ct), maxDiff, g_iCurrentRound);
+		}
 		
 		Msg("[FAB] Marked slot %d for balance: T->CT (round %d)\n", slot, g_iCurrentRound);
 	}
 	else if (ct > t && (ct - t) > maxDiff && team == 3)
 	{
-		// ✅ ЗАЩИТА: Не помечать если создаст пустую команду
 		if (ct <= 1)
 		{
-			const char* playerName = g_pPlayers->GetPlayerName(slot);
-			LogFAB("[DEATH] slot %d (%s) died in CT | T=%d CT=%d | SAFETY: Would create empty CT team | NOT marked",
-				slot, playerName ? playerName : "Unknown", t, ct);
+			if (g_bDebug)
+			{
+				const char* playerName = g_pPlayers->GetPlayerName(slot);
+				LogFAB("[DEATH] slot %d (%s) died in CT | T=%d CT=%d | SAFETY: Would create empty CT team | NOT marked",
+					slot, playerName ? playerName : "Unknown", t, ct);
+			}
 			return;
 		}
 		
-		// ПОМЕЧАЕМ для переноса CT → T
 		PendingBalance pending;
-		pending.targetTeam = 2;  // T
-		pending.deathTeam = 3;   // Умер в CT
+		pending.targetTeam = 2;
+		pending.deathTeam = 3;
 		pending.deathRound = g_iCurrentRound;
 		g_PendingBalance[slot] = pending;
 		
-		// ✅ ЛОГ ПОМЕТКИ
-		const char* playerName = g_pPlayers->GetPlayerName(slot);
-		const char* playerType = HasAdminPermission(slot) ? "Admin" : (HasVIPImmunity(slot) ? "VIP" : "Player");
-		LogFAB("[DEATH] slot %d (%s) %s died in CT | T=%d CT=%d diff=%d > maxDiff=%d | MARKED for T (round %d)",
-			slot, playerName ? playerName : "Unknown", playerType,
-			t, ct, abs(ct - t), maxDiff, g_iCurrentRound);
+		if (g_bDebug)
+		{
+			const char* playerName = g_pPlayers->GetPlayerName(slot);
+			const char* playerType = HasAdminPermission(slot) ? "Admin" : (HasVIPImmunity(slot) ? "VIP" : "Player");
+			LogFAB("[DEATH] slot %d (%s) %s died in CT | T=%d CT=%d diff=%d > maxDiff=%d | MARKED for T (round %d)",
+				slot, playerName ? playerName : "Unknown", playerType,
+				t, ct, abs(ct - t), maxDiff, g_iCurrentRound);
+		}
 		
 		Msg("[FAB] Marked slot %d for balance: CT->T (round %d)\n", slot, g_iCurrentRound);
 	}
-	else
+	else if (g_bDebug)
 	{
-		// ✅ ЛОГ ПРОПУСКА
 		const char* playerName = g_pPlayers->GetPlayerName(slot);
 		LogFAB("[DEATH] slot %d (%s) died in %s | T=%d CT=%d diff=%d <= maxDiff=%d | NOT marked",
 			slot, playerName ? playerName : "Unknown",
@@ -384,7 +378,6 @@ void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 	}
 }
 
-// ✅ При спавне - только проверяем что всё чисто
 void OnPlayerSpawn(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 {
 	if (!pEvent || !g_pPlayers || !g_pUtils) return;
@@ -392,16 +385,17 @@ void OnPlayerSpawn(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 	int slot = pEvent->GetInt("userid");
 	if (slot < 0 || slot >= 64) return;
 	
-	// ✅ Если игрок в pending - значит что-то пошло не так
-	// (должны были перенести на round_start)
 	auto it = g_PendingBalance.find(slot);
 	if (it != g_PendingBalance.end())
 	{
-		const char* playerName = g_pPlayers->GetPlayerName(slot);
-		const char* toTeam = it->second.targetTeam == 2 ? "T" : "CT";
-		
-		LogFAB("[SPAWN] slot %d (%s) | WARNING: Still in pending (target %s) | REMOVED (should have been transferred on round_start)",
-			slot, playerName ? playerName : "Unknown", toTeam);
+		if (g_bDebug)
+		{
+			const char* playerName = g_pPlayers->GetPlayerName(slot);
+			const char* toTeam = it->second.targetTeam == 2 ? "T" : "CT";
+			
+			LogFAB("[SPAWN] slot %d (%s) | WARNING: Still in pending (target %s) | REMOVED (should have been transferred on round_start)",
+				slot, playerName ? playerName : "Unknown", toTeam);
+		}
 		
 		g_PendingBalance.erase(slot);
 	}
@@ -411,65 +405,64 @@ void OnRoundStart(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 {
 	g_iCurrentRound++;
 	
-	// Считаем pending
 	int pendingCount = g_PendingBalance.size();
 	
-	// Считаем команды
 	int t, ct;
 	GetCounts(t, ct);
 	
-	// ✅ ЛОГ РАУНДА
-	LogFAB("[ROUND] Round %d started | T=%d CT=%d diff=%d | %d player(s) pending balance",
-		g_iCurrentRound, t, ct, abs(t - ct), pendingCount);
+	if (g_bDebug)
+	{
+		LogFAB("[ROUND] Round %d started | T=%d CT=%d diff=%d | %d player(s) pending balance",
+			g_iCurrentRound, t, ct, abs(t - ct), pendingCount);
+	}
 	
 	Msg("[FAB] Round %d started\n", g_iCurrentRound);
 	
-	// ✅ НОВОЕ: ПЕРЕНОСИМ ВСЕХ PENDING ПЕРЕД СПАВНОМ!
 	if (pendingCount > 0)
 	{
-		// Копируем список (чтобы можно было изменять оригинал)
 		std::vector<int> pendingSlots;
 		for (const auto& pair : g_PendingBalance)
 		{
 			pendingSlots.push_back(pair.first);
 		}
 		
-		// Переносим каждого
 		for (int slot : pendingSlots)
 		{
 			auto it = g_PendingBalance.find(slot);
 			if (it == g_PendingBalance.end())
-				continue;  // Уже удален
+				continue;
 			
 			PendingBalance pending = it->second;
 			const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : "Unknown";
 			
-			// ✅ ПРОВЕРКА 1: Игрок подключен?
 			if (!g_pPlayers || !g_pPlayers->IsConnected(slot) || g_pPlayers->IsFakeClient(slot))
 			{
 				g_PendingBalance.erase(slot);
-				LogFAB("[ROUND] slot %d (%s) | CHECK FAILED: not connected | REMOVED from pending",
-					slot, playerName ? playerName : "Unknown");
+				if (g_bDebug)
+				{
+					LogFAB("[ROUND] slot %d (%s) | CHECK FAILED: not connected | REMOVED from pending",
+						slot, playerName ? playerName : "Unknown");
+				}
 				continue;
 			}
 			
-			// ✅ ПРОВЕРКА 2: Игрок в правильной команде?
 			int currentTeam = g_iTeam[slot];
 			if (currentTeam != pending.deathTeam)
 			{
 				g_PendingBalance.erase(slot);
-				LogFAB("[ROUND] slot %d (%s) | CHECK FAILED: team changed (now %s, died in %s) | REMOVED from pending",
-					slot, playerName ? playerName : "Unknown",
-					currentTeam == 2 ? "T" : (currentTeam == 3 ? "CT" : "SPEC"),
-					pending.deathTeam == 2 ? "T" : "CT");
+				if (g_bDebug)
+				{
+					LogFAB("[ROUND] slot %d (%s) | CHECK FAILED: team changed (now %s, died in %s) | REMOVED from pending",
+						slot, playerName ? playerName : "Unknown",
+						currentTeam == 2 ? "T" : (currentTeam == 3 ? "CT" : "SPEC"),
+						pending.deathTeam == 2 ? "T" : "CT");
+				}
 				continue;
 			}
 			
-			// ✅ ПРОВЕРКА 3: Пересчитываем команды СЕЙЧАС
 			int t_now, ct_now;
 			GetCounts(t_now, ct_now);
 			
-			// ✅ ПРОВЕРКА 4: Пересчитываем лимит
 			int maxDiff = g_iMaxAD;
 			bool isAdmin = HasAdminPermission(slot);
 			bool isVIP = HasVIPImmunity(slot);
@@ -481,16 +474,15 @@ void OnRoundStart(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 			
 			const char* playerType = isAdmin ? "Admin" : (isVIP ? "VIP" : "Player");
 			
-			// ✅ ПРОВЕРКА 5: Баланс все еще нужен?
 			bool needBalance = false;
 			int currentDiff = abs(t_now - ct_now);
 			
-			if (pending.targetTeam == 3)  // T → CT
+			if (pending.targetTeam == 3)
 			{
 				if (t_now > ct_now && (t_now - ct_now) > maxDiff)
 					needBalance = true;
 			}
-			else if (pending.targetTeam == 2)  // CT → T
+			else if (pending.targetTeam == 2)
 			{
 				if (ct_now > t_now && (ct_now - t_now) > maxDiff)
 					needBalance = true;
@@ -499,49 +491,55 @@ void OnRoundStart(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 			if (!needBalance)
 			{
 				g_PendingBalance.erase(slot);
-				LogFAB("[ROUND] slot %d (%s) %s | T=%d CT=%d diff=%d <= maxDiff=%d | BALANCE NOT NEEDED | REMOVED from pending",
-					slot, playerName ? playerName : "Unknown", playerType,
-					t_now, ct_now, currentDiff, maxDiff);
+				if (g_bDebug)
+				{
+					LogFAB("[ROUND] slot %d (%s) %s | T=%d CT=%d diff=%d <= maxDiff=%d | BALANCE NOT NEEDED | REMOVED from pending",
+						slot, playerName ? playerName : "Unknown", playerType,
+						t_now, ct_now, currentDiff, maxDiff);
+				}
 				continue;
 			}
 			
-			// ✅ ЗАЩИТА #1: Не создавать ПУСТУЮ команду!
 			int t_after = t_now;
 			int ct_after = ct_now;
 			
-			if (pending.targetTeam == 3)  // T → CT
+			if (pending.targetTeam == 3)
 			{
-				t_after = t_now - 1;   // T потеряет игрока
-				ct_after = ct_now + 1; // CT получит игрока
+				t_after = t_now - 1;
+				ct_after = ct_now + 1;
 			}
-			else if (pending.targetTeam == 2)  // CT → T
+			else if (pending.targetTeam == 2)
 			{
-				t_after = t_now + 1;   // T получит игрока
-				ct_after = ct_now - 1; // CT потеряет игрока
+				t_after = t_now + 1;
+				ct_after = ct_now - 1;
 			}
 			
 			if (t_after <= 0 || ct_after <= 0)
 			{
 				g_PendingBalance.erase(slot);
-				LogFAB("[ROUND] slot %d (%s) %s | SAFETY: Would create empty team (T=%d CT=%d after transfer) | REMOVED from pending",
-					slot, playerName ? playerName : "Unknown", playerType,
-					t_after, ct_after);
+				if (g_bDebug)
+				{
+					LogFAB("[ROUND] slot %d (%s) %s | SAFETY: Would create empty team (T=%d CT=%d after transfer) | REMOVED from pending",
+						slot, playerName ? playerName : "Unknown", playerType,
+						t_after, ct_after);
+				}
 				continue;
 			}
 			
-			// ✅ ЗАЩИТА #2: Не ухудшать баланс (защита от пинг-понга)
 			int diff_after = abs(t_after - ct_after);
 			
 			if (diff_after >= currentDiff)
 			{
 				g_PendingBalance.erase(slot);
-				LogFAB("[ROUND] slot %d (%s) %s | SAFETY: Would not improve balance (diff now=%d, after=%d) | REMOVED from pending",
-					slot, playerName ? playerName : "Unknown", playerType,
-					currentDiff, diff_after);
+				if (g_bDebug)
+				{
+					LogFAB("[ROUND] slot %d (%s) %s | SAFETY: Would not improve balance (diff now=%d, after=%d) | REMOVED from pending",
+						slot, playerName ? playerName : "Unknown", playerType,
+						currentDiff, diff_after);
+				}
 				continue;
 			}
 			
-			// ✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ - ПЕРЕНОСИМ ПЕРЕД СПАВНОМ!
 			const char* fromTeam = pending.deathTeam == 2 ? "T" : "CT";
 			const char* toTeam = pending.targetTeam == 2 ? "T" : "CT";
 			
@@ -549,12 +547,14 @@ void OnRoundStart(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 			g_pPlayers->SwitchTeam(slot, pending.targetTeam);
 			g_iTeam[slot] = pending.targetTeam;
 			
-			// ✅ ЛОГ ПЕРЕНОСА
-			LogFAB("[ROUND] slot %d (%s) %s | T=%d CT=%d diff=%d > maxDiff=%d | TRANSFERRED %s->%s BEFORE SPAWN | SUCCESS",
-				slot, playerName ? playerName : "Unknown", playerType,
-				t_now, ct_now, currentDiff, maxDiff, fromTeam, toTeam);
+			if (g_bDebug)
+			{
+				LogFAB("[ROUND] slot %d (%s) %s | T=%d CT=%d diff=%d > maxDiff=%d | TRANSFERRED %s->%s | SUCCESS",
+					slot, playerName ? playerName : "Unknown", playerType,
+					t_now, ct_now, currentDiff, maxDiff, fromTeam, toTeam);
+			}
 			
-			Msg("[FAB] BALANCED: slot %d -> team %d (T=%d CT=%d) BEFORE SPAWN\n", 
+			Msg("[FAB] BALANCED: slot %d -> team %d (T=%d CT=%d)\n", 
 				slot, pending.targetTeam, t_now, ct_now);
 			
 			if (g_bShowMsg)
@@ -565,7 +565,6 @@ void OnRoundStart(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 				g_pUtils->PrintToChat(slot, " %s", msg);
 			}
 			
-			// ✅ Удаляем из списка
 			g_PendingBalance.erase(slot);
 		}
 	}
@@ -588,18 +587,23 @@ void OnPlayerDisconnect(const char* szName, IGameEvent* pEvent, bool bDontBroadc
 	int slot = pEvent->GetInt("userid");
 	if (slot >= 0 && slot < 64)
 	{
-		// ✅ Удаляем из списка на перенос
 		auto it = g_PendingBalance.find(slot);
 		if (it != g_PendingBalance.end())
 		{
-			const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : "Unknown";
-			const char* toTeam = it->second.targetTeam == 2 ? "T" : "CT";
-			
-			g_PendingBalance.erase(slot);
-			
-			// ✅ ЛОГ ОТКЛЮЧЕНИЯ
-			LogFAB("[DISCONNECT] slot %d (%s) disconnected | Was marked for %s | REMOVED from pending",
-				slot, playerName ? playerName : "Unknown", toTeam);
+			if (g_bDebug)
+			{
+				const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : "Unknown";
+				const char* toTeam = it->second.targetTeam == 2 ? "T" : "CT";
+				
+				g_PendingBalance.erase(slot);
+				
+				LogFAB("[DISCONNECT] slot %d (%s) disconnected | Was marked for %s | REMOVED from pending",
+					slot, playerName ? playerName : "Unknown", toTeam);
+			}
+			else
+			{
+				g_PendingBalance.erase(slot);
+			}
 			
 			Msg("[FAB] Removed slot %d from pending: disconnected\n", slot);
 		}
@@ -614,9 +618,11 @@ bool OnReloadCommand(int iSlot, const char* szContent)
 	LoadConfig();
 	LoadTranslations();
 	
-	// ✅ ЛОГ ПЕРЕЗАГРУЗКИ
-	const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(iSlot) : "Unknown";
-	LogFAB("[RELOAD] Config reloaded by slot %d (%s)", iSlot, playerName ? playerName : "Unknown");
+	if (g_bDebug)
+	{
+		const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(iSlot) : "Unknown";
+		LogFAB("[RELOAD] Config reloaded by slot %d (%s)", iSlot, playerName ? playerName : "Unknown");
+	}
 	
 	g_pUtils->PrintToChat(iSlot, " \x0B[FAB] \x04Config and translations reloaded!");
 	return true;
@@ -629,10 +635,12 @@ void OnStartupServer()
 	g_iCurrentRound = 0;
 	g_PendingBalance.clear();
 	
-	// ✅ ЛОГ СТАРТА СЕРВЕРА
-	LogFAB("========================================");
-	LogFAB("[SERVER] FastAutoBalance v1.3 started");
-	LogFAB("========================================");
+	if (g_bDebug)
+	{
+		LogFAB("========================================");
+		LogFAB("[SERVER] FastAutoBalance v1.3.2 started");
+		LogFAB("========================================");
+	}
 }
 
 bool FastAutoBalance::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late)
@@ -642,11 +650,11 @@ bool FastAutoBalance::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxle
 	GET_V_IFACE_CURRENT(GetEngineFactory, engine, IVEngineServer2, SOURCE2ENGINETOSERVER_INTERFACE_VERSION);
 	GET_V_IFACE_CURRENT(GetFileSystemFactory, filesystem, IFileSystem, FILESYSTEM_INTERFACE_VERSION);
 	
-	Msg("[FAB] Loading v1.3 FINAL (round_start balance + safety checks)...\n");
+	Msg("[FAB] Loading v1.3.2...\n");
 	return true;
 }
 
-bool FastAutoBalance::Unload(char* error, size_t maxlen)
+bool FastAutoBalance::Unload(char *error, size_t maxlen)
 {
 	if (g_pUtils) g_pUtils->ClearAllHooks(g_PLID);
 	
@@ -661,7 +669,7 @@ bool FastAutoBalance::Unload(char* error, size_t maxlen)
 
 void FastAutoBalance::AllPluginsLoaded()
 {
-	Msg("[FAB] AllPluginsLoaded() v1.3\n");
+	Msg("[FAB] AllPluginsLoaded() v1.3.2\n");
 	
 	int ret;
 	
@@ -723,7 +731,7 @@ const char *FastAutoBalance::GetLicense()
 
 const char *FastAutoBalance::GetVersion()
 {
-	return "1.3.1";
+	return "1.3.2";
 }
 
 const char *FastAutoBalance::GetDate()
