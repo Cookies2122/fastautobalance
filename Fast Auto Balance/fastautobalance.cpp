@@ -300,7 +300,10 @@ void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 	if (team <= 1) return;
 	
 	int t, ct;
-	GetCounts(t, ct, slot);
+	GetCounts(t, ct);
+	
+	if (team == 2) t--;
+	else if (team == 3) ct--;
 	
 	int maxDiff = g_iMaxAD;
 	if (HasAdminPermission(slot))
@@ -310,7 +313,7 @@ void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 	
 	if (t > ct && (t - ct) > maxDiff && team == 2)
 	{
-		if (t <= 1)
+		if (t <= 0)
 		{
 			if (g_bDebug)
 			{
@@ -331,7 +334,7 @@ void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 		{
 			const char* playerName = g_pPlayers->GetPlayerName(slot);
 			const char* playerType = HasAdminPermission(slot) ? "Admin" : (HasVIPImmunity(slot) ? "VIP" : "Player");
-			LogFAB("[DEATH] slot %d (%s) %s died in T | T=%d CT=%d diff=%d > maxDiff=%d | MARKED for CT (round %d)",
+			LogFAB("[DEATH] slot %d (%s) %s died in T | AFTER death: T=%d CT=%d diff=%d > maxDiff=%d | MARKED for CT (round %d)",
 				slot, playerName ? playerName : "Unknown", playerType,
 				t, ct, abs(t - ct), maxDiff, g_iCurrentRound);
 		}
@@ -340,7 +343,7 @@ void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 	}
 	else if (ct > t && (ct - t) > maxDiff && team == 3)
 	{
-		if (ct <= 1)
+		if (ct <= 0)
 		{
 			if (g_bDebug)
 			{
@@ -361,7 +364,7 @@ void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 		{
 			const char* playerName = g_pPlayers->GetPlayerName(slot);
 			const char* playerType = HasAdminPermission(slot) ? "Admin" : (HasVIPImmunity(slot) ? "VIP" : "Player");
-			LogFAB("[DEATH] slot %d (%s) %s died in CT | T=%d CT=%d diff=%d > maxDiff=%d | MARKED for T (round %d)",
+			LogFAB("[DEATH] slot %d (%s) %s died in CT | AFTER death: T=%d CT=%d diff=%d > maxDiff=%d | MARKED for T (round %d)",
 				slot, playerName ? playerName : "Unknown", playerType,
 				t, ct, abs(ct - t), maxDiff, g_iCurrentRound);
 		}
@@ -371,7 +374,7 @@ void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 	else if (g_bDebug)
 	{
 		const char* playerName = g_pPlayers->GetPlayerName(slot);
-		LogFAB("[DEATH] slot %d (%s) died in %s | T=%d CT=%d diff=%d <= maxDiff=%d | NOT marked",
+		LogFAB("[DEATH] slot %d (%s) died in %s | AFTER death: T=%d CT=%d diff=%d <= maxDiff=%d | NOT marked",
 			slot, playerName ? playerName : "Unknown",
 			team == 2 ? "T" : "CT",
 			t, ct, abs(t - ct), maxDiff);
@@ -462,6 +465,17 @@ void OnRoundStart(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 			
 			int t_now, ct_now;
 			GetCounts(t_now, ct_now);
+			
+			if (t_now <= 1 || ct_now <= 1)
+			{
+				g_PendingBalance.erase(slot);
+				if (g_bDebug)
+				{
+					LogFAB("[ROUND] slot %d (%s) | SAFETY: One team too small (T=%d CT=%d) | NOT transferred",
+						slot, playerName ? playerName : "Unknown", t_now, ct_now);
+				}
+				continue;
+			}
 			
 			int maxDiff = g_iMaxAD;
 			bool isAdmin = HasAdminPermission(slot);
@@ -638,7 +652,7 @@ void OnStartupServer()
 	if (g_bDebug)
 	{
 		LogFAB("========================================");
-		LogFAB("[SERVER] FastAutoBalance v1.3.2 started");
+		LogFAB("[SERVER] FastAutoBalance v1.3.3 started");
 		LogFAB("========================================");
 	}
 }
@@ -650,7 +664,7 @@ bool FastAutoBalance::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxle
 	GET_V_IFACE_CURRENT(GetEngineFactory, engine, IVEngineServer2, SOURCE2ENGINETOSERVER_INTERFACE_VERSION);
 	GET_V_IFACE_CURRENT(GetFileSystemFactory, filesystem, IFileSystem, FILESYSTEM_INTERFACE_VERSION);
 	
-	Msg("[FAB] Loading v1.3.2...\n");
+	Msg("[FAB] Loading v1.3.3...\n");
 	return true;
 }
 
@@ -669,7 +683,7 @@ bool FastAutoBalance::Unload(char *error, size_t maxlen)
 
 void FastAutoBalance::AllPluginsLoaded()
 {
-	Msg("[FAB] AllPluginsLoaded() v1.3.2\n");
+	Msg("[FAB] AllPluginsLoaded() v1.3.3\n");
 	
 	int ret;
 	
@@ -731,7 +745,7 @@ const char *FastAutoBalance::GetLicense()
 
 const char *FastAutoBalance::GetVersion()
 {
-	return "1.3.2";
+	return "1.3.3";
 }
 
 const char *FastAutoBalance::GetDate()
