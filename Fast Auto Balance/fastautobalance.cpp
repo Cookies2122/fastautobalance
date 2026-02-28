@@ -182,6 +182,7 @@ void LoadConfig()
 	g_iVIPMax = kv->GetInt("vip_max", 3);
 	g_iVIPBlock = kv->GetInt("vip_block", 2);
 	
+	g_vecVIPGroups.clear();
 	const char* vipGroups = kv->GetString("vip_groups", "");
 	if (vipGroups && *vipGroups)
 	{
@@ -285,7 +286,47 @@ void OnPlayerTeam(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 	if (!pEvent) return;
 	int slot = pEvent->GetInt("userid");
 	int team = pEvent->GetInt("team");
-	if (slot >= 0 && slot < 64) g_iTeam[slot] = team;
+	int oldTeam = pEvent->GetInt("oldteam");
+	
+	if (slot < 0 || slot >= 64) return;
+	
+	int prevCached = g_iTeam[slot];
+	g_iTeam[slot] = team;
+	
+	if (team <= 1 && oldTeam >= 2)
+	{
+		auto it = g_PendingBalance.find(slot);
+		if (it != g_PendingBalance.end())
+		{
+			g_PendingBalance.erase(slot);
+			if (g_bDebug)
+			{
+				const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : "Unknown";
+				LogFAB("[TEAM] slot %d (%s) went to SPEC (was %s) | REMOVED from pending",
+					slot, playerName ? playerName : "Unknown",
+					oldTeam == 2 ? "T" : "CT");
+			}
+		}
+		
+		if (g_bDebug && prevCached >= 2)
+		{
+			const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : "Unknown";
+			int t, ct;
+			GetCounts(t, ct);
+			LogFAB("[TEAM] slot %d (%s) %s->SPEC | Now: T=%d CT=%d",
+				slot, playerName ? playerName : "Unknown",
+				oldTeam == 2 ? "T" : "CT", t, ct);
+		}
+	}
+	else if (g_bDebug)
+	{
+		const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : "Unknown";
+		int t, ct;
+		GetCounts(t, ct);
+		LogFAB("[TEAM] slot %d (%s) %d->%d | Now: T=%d CT=%d",
+			slot, playerName ? playerName : "Unknown",
+			oldTeam, team, t, ct);
+	}
 }
 
 void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
@@ -297,6 +338,7 @@ void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 	if (!g_pPlayers->IsConnected(slot) || g_pPlayers->IsFakeClient(slot)) return;
 	
 	int team = g_iTeam[slot];
+	
 	if (team <= 1) return;
 	
 	int t, ct;
@@ -408,7 +450,7 @@ void OnRoundStart(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 {
 	g_iCurrentRound++;
 	
-	int pendingCount = g_PendingBalance.size();
+	int pendingCount = (int)g_PendingBalance.size();
 	
 	int t, ct;
 	GetCounts(t, ct);
@@ -450,6 +492,7 @@ void OnRoundStart(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 			}
 			
 			int currentTeam = g_iTeam[slot];
+			
 			if (currentTeam != pending.deathTeam)
 			{
 				g_PendingBalance.erase(slot);
@@ -609,16 +652,11 @@ void OnPlayerDisconnect(const char* szName, IGameEvent* pEvent, bool bDontBroadc
 				const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : "Unknown";
 				const char* toTeam = it->second.targetTeam == 2 ? "T" : "CT";
 				
-				g_PendingBalance.erase(slot);
-				
 				LogFAB("[DISCONNECT] slot %d (%s) disconnected | Was marked for %s | REMOVED from pending",
 					slot, playerName ? playerName : "Unknown", toTeam);
 			}
-			else
-			{
-				g_PendingBalance.erase(slot);
-			}
 			
+			g_PendingBalance.erase(slot);
 			Msg("[FAB] Removed slot %d from pending: disconnected\n", slot);
 		}
 		
@@ -649,10 +687,16 @@ void OnStartupServer()
 	g_iCurrentRound = 0;
 	g_PendingBalance.clear();
 	
+	for (int i = 0; i < 64; i++)
+	{
+		g_iTeam[i] = 0;
+		g_bChangingTeam[i] = false;
+	}
+	
 	if (g_bDebug)
 	{
 		LogFAB("========================================");
-		LogFAB("[SERVER] FastAutoBalance v1.3.3 started");
+		LogFAB("[SERVER] FastAutoBalance v1.3.4 started");
 		LogFAB("========================================");
 	}
 }
@@ -664,8 +708,7 @@ bool FastAutoBalance::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxle
 	GET_V_IFACE_CURRENT(GetEngineFactory, engine, IVEngineServer2, SOURCE2ENGINETOSERVER_INTERFACE_VERSION);
 	GET_V_IFACE_CURRENT(GetFileSystemFactory, filesystem, IFileSystem, FILESYSTEM_INTERFACE_VERSION);
 	
-	Msg("[FAB] Loading v1.3.3...\n");
-	return true;
+	Msg("[FAB] Loading v1.3.4...\n");	return true;
 }
 
 bool FastAutoBalance::Unload(char *error, size_t maxlen)
@@ -683,7 +726,7 @@ bool FastAutoBalance::Unload(char *error, size_t maxlen)
 
 void FastAutoBalance::AllPluginsLoaded()
 {
-	Msg("[FAB] AllPluginsLoaded() v1.3.3\n");
+	Msg("[FAB] AllPluginsLoaded() v1.3.4\n");
 	
 	int ret;
 	
@@ -724,20 +767,20 @@ void FastAutoBalance::AllPluginsLoaded()
 	g_pUtils->StartupServer(g_PLID, OnStartupServer);
 	
 	Msg("[FAB] Hooking events...\n");
-	g_pUtils->HookEvent(g_PLID, "player_team", OnPlayerTeamPre);
-	g_pUtils->HookEvent(g_PLID, "player_team", OnPlayerTeam);
-	g_pUtils->HookEvent(g_PLID, "player_death", OnPlayerDeath);
-	g_pUtils->HookEvent(g_PLID, "player_spawn", OnPlayerSpawn);
-	g_pUtils->HookEvent(g_PLID, "round_start", OnRoundStart);
-	g_pUtils->HookEvent(g_PLID, "player_connect_full", OnPlayerConnect);
-	g_pUtils->HookEvent(g_PLID, "player_disconnect", OnPlayerDisconnect);
+	g_pUtils->HookEvent(g_PLID, "player_team",           OnPlayerTeamPre);
+	g_pUtils->HookEvent(g_PLID, "player_team",           OnPlayerTeam);
+	g_pUtils->HookEvent(g_PLID, "player_death",          OnPlayerDeath);
+	g_pUtils->HookEvent(g_PLID, "player_spawn",          OnPlayerSpawn);
+	g_pUtils->HookEvent(g_PLID, "round_start",           OnRoundStart);
+	g_pUtils->HookEvent(g_PLID, "player_connect_full",   OnPlayerConnect);
+	g_pUtils->HookEvent(g_PLID, "player_disconnect",     OnPlayerDisconnect);
 	
 	g_pUtils->RegCommand(g_PLID, {"fab_reload"}, {}, OnReloadCommand);
 	
 	Msg("[FAB] Loaded successfully!\n");
 }
 
-///////////////////////////////////////
+/////////////////////////////////////////////////////////////////
 const char *FastAutoBalance::GetLicense()
 {
 	return "Public";
@@ -745,7 +788,7 @@ const char *FastAutoBalance::GetLicense()
 
 const char *FastAutoBalance::GetVersion()
 {
-	return "1.3.3";
+	return "1.3.4";
 }
 
 const char *FastAutoBalance::GetDate()
