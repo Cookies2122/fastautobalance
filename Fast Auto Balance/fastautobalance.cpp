@@ -1,783 +1,749 @@
 #include "fastautobalance.h"
 
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+
 FastAutoBalance g_FastAutoBalance;
 PLUGIN_EXPOSE(FastAutoBalance, g_FastAutoBalance);
-
 PLUGIN_GLOBALVARS();
 
-IUtilsApi* g_pUtils = nullptr;
-IPlayersApi* g_pPlayers = nullptr;
-IVIPApi* g_pVIPCore = nullptr;
-IAdminApi* g_pAdminCore = nullptr;
-IVEngineServer2* engine = nullptr;
-IFileSystem* filesystem = nullptr;
+IUtilsApi*       g_pUtils       = nullptr;
+IPlayersApi*     g_pPlayers     = nullptr;
+IVIPApi*         g_pVIPCore     = nullptr;
+IAdminApi*       g_pAdminCore   = nullptr;
+IVEngineServer2* engine         = nullptr;
+IFileSystem*     filesystem     = nullptr;
 
-std::map<std::string, std::string> g_Phrases;
+CGameEntitySystem* g_pGameEntitySystem = nullptr;
+CEntitySystem*     g_pEntitySystem     = nullptr;
+CGlobalVars*       gpGlobals           = nullptr;
 
-int g_iMaxAD = 2;
-int g_iBlock = 1;
-bool g_bShowMsg = true;
-bool g_bDebug = false;
-
-bool g_bAdminImmune = true;
-std::string g_sAdminFlag = "@admin/balance";
-int g_iAdminMax = 3;
-int g_iAdminBlock = 2;
-
-bool g_bVIPImmune = true;
-std::vector<std::string> g_vecVIPGroups;
-int g_iVIPMax = 3;
-int g_iVIPBlock = 2;
-
-int g_iTeam[64] = {0};
-bool g_bChangingTeam[64] = {false};
-
-struct PendingBalance {
-	int targetTeam;
-	int deathTeam;
-	int deathRound;
-};
-std::map<int, PendingBalance> g_PendingBalance;
-int g_iCurrentRound = 0;
-
-void LogFAB(const char* format, ...)
+CGameEntitySystem* GameEntitySystem()
 {
-	if (!g_pUtils) return;
-	
-	char buffer[512];
-	va_list args;
-	va_start(args, format);
-	vsnprintf(buffer, sizeof(buffer), format, args);
-	va_end(args);
-	
-	g_pUtils->LogToFile("FAB", "%s", buffer);
+	return g_pUtils ? g_pUtils->GetCGameEntitySystem() : nullptr;
 }
 
-const char* GetTranslation(const char* key)
+namespace
 {
-	auto it = g_Phrases.find(key);
-	if (it != g_Phrases.end())
-		return it->second.c_str();
-	
-	if (!strcmp(key, "FAB_Chat_T"))
-		return "{BLUE}[FAB] {DEFAULT}You were transferred to the team {RED}Terrorists {DEFAULT}for balance";
-	if (!strcmp(key, "FAB_Chat_CT"))
-		return "{BLUE}[FAB] {DEFAULT}You were transferred to the team {RED}Counter-Terrorists {DEFAULT}for balance";
-	if (!strcmp(key, "FAB_Block"))
-		return "{BLUE}[FAB] {DEFAULT}You cannot switch to this team, the difference is too big!";
-	
-	return key;
+	constexpr int MAX_SLOTS = 64;
+	constexpr int T_SPEC    = 1;
+	constexpr int T_T       = 2;
+	constexpr int T_CT      = 3;
+	constexpr const char* TAG = "[FAB]";
+	constexpr const char* VER = "2.1.0";
+
+	struct Cfg
+	{
+		int  dieGap         = 2;
+		int  swapGap        = 1;
+		bool yapAtPlayer    = true;
+		bool noisy          = false;
+		bool muteNative     = true;
+
+		bool admShield      = true;
+		std::string admPerm = "@admin/balance";
+		int  admDieGap      = 3;
+		int  admSwapGap     = 2;
+
+		bool vipShield      = true;
+		std::vector<std::string> vipBands;
+		int  vipDieGap      = 3;
+		int  vipSwapGap     = 2;
+	};
+
+	Cfg cfg;
+
+	int  slotTeam[MAX_SLOTS]  = {0};
+	bool selfNudge[MAX_SLOTS] = {false};
+	bool vetoMark[MAX_SLOTS]  = {false};
+
+	struct Marked
+	{
+		int dst;
+		int src;
+		int rno;
+	};
+
+	std::map<int, Marked> queue;
+	int rno = 0;
+
+	std::map<std::string, std::string> loc;
 }
 
-void LoadTranslations()
+static bool slotOk(int s) { return s >= 0 && s < MAX_SLOTS; }
+
+static bool realDude(int s)
 {
-	g_Phrases.clear();
-	
-	KeyValues* kv = new KeyValues("Phrases");
-	const char* path = "addons/translations/fab_phrases.txt";
-	
-	if (!kv->LoadFromFile(filesystem, path, "GAME"))
+	return g_pPlayers
+		&& g_pPlayers->IsConnected(s)
+		&& !g_pPlayers->IsFakeClient(s);
+}
+
+static const char* sideName(int t)
+{
+	if (t == T_T)    return "T";
+	if (t == T_CT)   return "CT";
+	if (t == T_SPEC) return "SPEC";
+	return "NONE";
+}
+
+static const char* nameOf(int s)
+{
+	const char* n = g_pPlayers ? g_pPlayers->GetPlayerName(s) : nullptr;
+	return (n && n[0]) ? n : "Unknown";
+}
+
+static void mkLogDir()
+{
+	if (filesystem) filesystem->CreateDirHierarchy("addons/logs/fab", "GAME");
+}
+
+static void dbg(const char* fmt, ...)
+{
+	if (!cfg.noisy) return;
+
+	mkLogDir();
+
+	time_t raw = time(nullptr);
+	struct tm tmNow;
+#ifdef _WIN32
+	localtime_s(&tmNow, &raw);
+#else
+	localtime_r(&raw, &tmNow);
+#endif
+
+	char d[32];
+	snprintf(d, sizeof(d), "%02d_%02d_%04d",
+		tmNow.tm_mday, tmNow.tm_mon + 1, tmNow.tm_year + 1900);
+
+	char p[512];
+	g_SMAPI->PathFormat(p, sizeof(p),
+		"%s/addons/logs/fab/fab_%s.txt", g_SMAPI->GetBaseDir(), d);
+
+	FILE* fp = fopen(p, "a");
+	if (!fp) return;
+
+	char tStr[16];
+	snprintf(tStr, sizeof(tStr), "%02d:%02d:%02d",
+		tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec);
+
+	char buf[1024];
+	va_list a;
+	va_start(a, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, a);
+	va_end(a);
+
+	fprintf(fp, "[%s] %s\n", tStr, buf);
+	fclose(fp);
+}
+
+static std::vector<std::string> chopCsv(const std::string& s)
+{
+	std::vector<std::string> out;
+	size_t start = 0;
+	for (size_t i = 0; i <= s.length(); ++i)
 	{
-		Msg("[FAB] Failed to load translations from %s, using defaults\n", path);
-		delete kv;
-		return;
-	}
-	
-	const char* language = g_pUtils ? g_pUtils->GetLanguage() : "en";
-	
-	FOR_EACH_SUBKEY(kv, pSubKey)
-	{
-		const char* keyName = pSubKey->GetName();
-		const char* translation = pSubKey->GetString(language, "");
-		
-		if (translation && translation[0])
+		if (i == s.length() || s[i] == ',')
 		{
-			g_Phrases[keyName] = translation;
+			size_t b = start, e = i;
+			while (b < e && (s[b] == ' ' || s[b] == '\t')) ++b;
+			while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t')) --e;
+			if (b < e) out.emplace_back(s.substr(b, e - b));
+			start = i + 1;
 		}
 	}
-	
-	delete kv;
-	
-	Msg("[FAB] Loaded translations for language: %s\n", language);
+	return out;
 }
 
-void GetCounts(int& t, int& ct, int excludeSlot = -1)
+static void headCount(int& t, int& ct, int skip = -1)
 {
-	t = ct = 0;
-	for (int i = 0; i < 64; i++)
+	t = 0;
+	ct = 0;
+	for (int i = 0; i < MAX_SLOTS; ++i)
 	{
-		if (i == excludeSlot) continue;
-		if (!g_pPlayers || !g_pPlayers->IsConnected(i) || g_pPlayers->IsFakeClient(i))
-			continue;
-		if (g_iTeam[i] == 2) t++;
-		else if (g_iTeam[i] == 3) ct++;
+		if (i == skip)              continue;
+		if (!realDude(i))           continue;
+		if (slotTeam[i] == T_T)     ++t;
+		else if (slotTeam[i] == T_CT) ++ct;
 	}
 }
 
-std::vector<std::string> SplitString(const std::string& str, const std::string& delimiter)
+static bool isAdmin(int s)
 {
-	std::vector<std::string> result;
-	size_t start = 0;
-	size_t end = str.find(delimiter);
-	
-	while (end != std::string::npos)
-	{
-		result.push_back(str.substr(start, end - start));
-		start = end + delimiter.length();
-		end = str.find(delimiter, start);
-	}
-	
-	result.push_back(str.substr(start));
-	return result;
+	if (!cfg.admShield || !g_pAdminCore) return false;
+	return g_pAdminCore->HasPermission(s, cfg.admPerm.c_str());
 }
 
-bool HasAdminPermission(int iSlot)
+static bool isVip(int s)
 {
-	if (!g_bAdminImmune || !g_pAdminCore) return false;
-	return g_pAdminCore->HasPermission(iSlot, g_sAdminFlag.c_str());
-}
+	if (!cfg.vipShield || !g_pVIPCore) return false;
+	if (!g_pVIPCore->VIP_IsClientVIP(s)) return false;
+	if (cfg.vipBands.empty()) return true;
 
-bool HasVIPImmunity(int iSlot)
-{
-	if (!g_bVIPImmune || !g_pVIPCore) return false;
-	if (!g_pVIPCore->VIP_IsClientVIP(iSlot)) return false;
-	
-	if (g_vecVIPGroups.empty()) return true;
-	
-	const char* playerGroup = g_pVIPCore->VIP_GetClientVIPGroup(iSlot);
-	if (!playerGroup) return false;
-	
-	for (const auto& group : g_vecVIPGroups)
-	{
-		if (group == playerGroup)
-			return true;
-	}
-	
+	const char* g = g_pVIPCore->VIP_GetClientVIPGroup(s);
+	if (!g || !g[0]) return false;
+	for (const auto& v : cfg.vipBands)
+		if (v == g) return true;
 	return false;
 }
 
-void LoadConfig()
+static int dieLimit(int s)
 {
-	KeyValues* kv = new KeyValues("fab");
-	const char* configPath = "addons/configs/fastautobalance.ini";
-	
-	if (!kv->LoadFromFile(filesystem, configPath, "GAME"))
+	if (isAdmin(s)) return cfg.admDieGap;
+	if (isVip(s))   return cfg.vipDieGap;
+	return cfg.dieGap;
+}
+
+static int swapLimit(int s)
+{
+	if (isAdmin(s)) return cfg.admSwapGap;
+	if (isVip(s))   return cfg.vipSwapGap;
+	return cfg.swapGap;
+}
+
+static const char* tier(int s)
+{
+	if (isAdmin(s)) return "Admin";
+	if (isVip(s))   return "VIP";
+	return "Player";
+}
+
+static const char* phrase(const char* k)
+{
+	auto it = loc.find(k);
+	if (it != loc.end()) return it->second.c_str();
+
+	if (!strcmp(k, "FAB_Chat_T"))
+		return "{BLUE}[FAB] {DEFAULT}You were transferred to the team {RED}Terrorists {DEFAULT}for balance";
+	if (!strcmp(k, "FAB_Chat_CT"))
+		return "{BLUE}[FAB] {DEFAULT}You were transferred to the team {RED}Counter-Terrorists {DEFAULT}for balance";
+	if (!strcmp(k, "FAB_Block"))
+		return "{BLUE}[FAB] {DEFAULT}You cannot switch to this team, the difference is too big!";
+	return k;
+}
+
+static void lazyMove(int s, int dst)
+{
+	if (!g_pUtils || !g_pPlayers) return;
+
+	g_pUtils->CreateTimer(0.1f, [s, dst]() -> float {
+		if (!g_pPlayers || !g_pPlayers->IsConnected(s))
+			return -1.0f;
+		selfNudge[s] = true;
+		g_pPlayers->SwitchTeam(s, dst);
+		return -1.0f;
+	});
+}
+
+static void killNative()
+{
+	if (!engine) return;
+	if (!cfg.muteNative)
 	{
-		Msg("[FAB] Config not found at %s, using defaults\n", configPath);
+		dbg("[NATIVE] muteNative=0 -- not touching mp_autoteambalance / mp_limitteams");
+		return;
+	}
+	engine->ServerCommand("mp_autoteambalance 0\n");
+	engine->ServerCommand("mp_limitteams 0\n");
+	Msg("%s native balance disabled (mp_autoteambalance 0, mp_limitteams 0)\n", TAG);
+	dbg("[NATIVE] forced mp_autoteambalance 0 + mp_limitteams 0");
+}
+
+static void pullCfg()
+{
+	cfg = Cfg();
+
+	KeyValues* kv = new KeyValues("fab");
+	const char* path = "addons/configs/fastautobalance.ini";
+
+	if (!kv->LoadFromFile(filesystem, path, "GAME"))
+	{
+		Msg("%s no cfg at %s, using defaults\n", TAG, path);
 		delete kv;
 		return;
 	}
-	
-	g_iMaxAD = kv->GetInt("MaxAD", 2);
-	g_iBlock = kv->GetInt("block", 1);
-	g_bShowMsg = kv->GetBool("msg", true);
-	g_bDebug = kv->GetBool("debug", false);
-	
-	g_bAdminImmune = kv->GetBool("admin_imune", true);
-	g_sAdminFlag = kv->GetString("admin_flags", "@admin/balance");
-	g_iAdminMax = kv->GetInt("admin_max", 3);
-	g_iAdminBlock = kv->GetInt("admin_block", 2);
-	
-	g_bVIPImmune = kv->GetBool("vip_imune", true);
-	g_iVIPMax = kv->GetInt("vip_max", 3);
-	g_iVIPBlock = kv->GetInt("vip_block", 2);
-	
-	g_vecVIPGroups.clear();
-	const char* vipGroups = kv->GetString("vip_groups", "");
-	if (vipGroups && *vipGroups)
-	{
-		g_vecVIPGroups = SplitString(std::string(vipGroups), ",");
-	}
-	
+
+	cfg.dieGap       = kv->GetInt("MaxAD",            cfg.dieGap);
+	cfg.swapGap      = kv->GetInt("block",            cfg.swapGap);
+	cfg.yapAtPlayer  = kv->GetBool("msg",             cfg.yapAtPlayer);
+	cfg.noisy        = kv->GetBool("debug",           cfg.noisy);
+	cfg.muteNative   = kv->GetBool("force_native_off", cfg.muteNative);
+
+	cfg.admShield    = kv->GetBool("admin_imune",     cfg.admShield);
+	cfg.admPerm      = kv->GetString("admin_flags",   cfg.admPerm.c_str());
+	cfg.admDieGap    = kv->GetInt("admin_max",        cfg.admDieGap);
+	cfg.admSwapGap   = kv->GetInt("admin_block",      cfg.admSwapGap);
+
+	cfg.vipShield    = kv->GetBool("vip_imune",       cfg.vipShield);
+	cfg.vipDieGap    = kv->GetInt("vip_max",          cfg.vipDieGap);
+	cfg.vipSwapGap   = kv->GetInt("vip_block",        cfg.vipSwapGap);
+
+	cfg.vipBands.clear();
+	const char* vg = kv->GetString("vip_groups", "");
+	if (vg && *vg) cfg.vipBands = chopCsv(vg);
+
 	delete kv;
-	
-	Msg("[FAB] Config loaded: MaxAD=%d, Block=%d, AdminMax=%d, AdminBlock=%d, VIPMax=%d, VIPBlock=%d, Debug=%s\n", 
-		g_iMaxAD, g_iBlock, g_iAdminMax, g_iAdminBlock, g_iVIPMax, g_iVIPBlock, g_bDebug ? "ON" : "OFF");
-	
-	if (g_bDebug)
+
+	Msg("%s cfg: die=%d swap=%d msg=%d dbg=%d native_off=%d | adm: shield=%d die=%d swap=%d perm=%s | vip: shield=%d die=%d swap=%d\n",
+		TAG,
+		cfg.dieGap, cfg.swapGap, (int)cfg.yapAtPlayer, (int)cfg.noisy, (int)cfg.muteNative,
+		(int)cfg.admShield, cfg.admDieGap, cfg.admSwapGap, cfg.admPerm.c_str(),
+		(int)cfg.vipShield, cfg.vipDieGap, cfg.vipSwapGap);
+
+	if (cfg.noisy)
 	{
-		std::string vipGroupsStr = "all";
-		if (!g_vecVIPGroups.empty())
+		std::string vs = "all";
+		if (!cfg.vipBands.empty())
 		{
-			vipGroupsStr = "";
-			for (size_t i = 0; i < g_vecVIPGroups.size(); i++)
+			vs.clear();
+			for (size_t i = 0; i < cfg.vipBands.size(); ++i)
 			{
-				if (i > 0) vipGroupsStr += ",";
-				vipGroupsStr += g_vecVIPGroups[i];
+				if (i) vs += ",";
+				vs += cfg.vipBands[i];
 			}
 		}
-		
-		LogFAB("[CONFIG] MaxAD=%d block=%d msg=%d debug=%d | Admin: imune=%d max=%d block=%d flags=%s | VIP: imune=%d max=%d block=%d groups=%s",
-			g_iMaxAD, g_iBlock, g_bShowMsg, g_bDebug,
-			g_bAdminImmune, g_iAdminMax, g_iAdminBlock, g_sAdminFlag.c_str(),
-			g_bVIPImmune, g_iVIPMax, g_iVIPBlock, 
-			vipGroupsStr.c_str());
+		dbg("[CFG] die=%d swap=%d msg=%d native_off=%d | adm: shield=%d die=%d swap=%d perm=%s | vip: shield=%d die=%d swap=%d bands=%s",
+			cfg.dieGap, cfg.swapGap, (int)cfg.yapAtPlayer, (int)cfg.muteNative,
+			(int)cfg.admShield, cfg.admDieGap, cfg.admSwapGap, cfg.admPerm.c_str(),
+			(int)cfg.vipShield, cfg.vipDieGap, cfg.vipSwapGap,
+			vs.c_str());
 	}
 }
 
-void OnPlayerTeamPre(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+static void pullPhrases()
 {
-	if (!pEvent || !g_pPlayers || !g_pUtils) return;
-	
-	int slot = pEvent->GetInt("userid");
-	int newTeam = pEvent->GetInt("team");
-	int oldTeam = pEvent->GetInt("oldteam");
-	bool disconnect = pEvent->GetBool("disconnect");
-	
-	if (slot < 0 || slot >= 64) return;
-	if (g_pPlayers->IsFakeClient(slot)) return;
-	if (disconnect) return;
-	if (newTeam <= 1 || oldTeam <= 1) return;
-	if (newTeam == oldTeam) return;
+	loc.clear();
 
-	if (g_bChangingTeam[slot])
+	KeyValues* kv = new KeyValues("Phrases");
+	const char* path = "addons/translations/fab_phrases.txt";
+
+	if (!kv->LoadFromFile(filesystem, path, "GAME"))
 	{
-		g_bChangingTeam[slot] = false;
+		Msg("%s no phrases at %s, using defaults\n", TAG, path);
+		delete kv;
+		return;
+	}
+
+	const char* lang = g_pUtils ? g_pUtils->GetLanguage() : "en";
+
+	FOR_EACH_SUBKEY(kv, p)
+	{
+		const char* k = p->GetName();
+		const char* v = p->GetString(lang, "");
+		if (k && v && v[0]) loc[k] = v;
+	}
+
+	delete kv;
+	Msg("%s phrases for: %s\n", TAG, lang ? lang : "en");
+}
+
+static bool tagDeath(int s, int t, int ct, int side)
+{
+	const int lim = dieLimit(s);
+
+	if (side == T_T && t > ct && (t - ct) > lim)
+	{
+		if (t <= 0)
+		{
+			dbg("[DEATH] slot %d (%s) died T | T=%d CT=%d | safety: empty T | NOT marked",
+				s, nameOf(s), t, ct);
+			return false;
+		}
+		queue[s] = { T_CT, T_T, rno };
+		dbg("[DEATH] slot %d (%s) %s died T | T=%d CT=%d gap=%d > lim=%d | MARKED for CT (round %d)",
+			s, nameOf(s), tier(s), t, ct, (t - ct), lim, rno);
+		Msg("%s marked %d: T->CT (round %d)\n", TAG, s, rno);
+		return true;
+	}
+
+	if (side == T_CT && ct > t && (ct - t) > lim)
+	{
+		if (ct <= 0)
+		{
+			dbg("[DEATH] slot %d (%s) died CT | T=%d CT=%d | safety: empty CT | NOT marked",
+				s, nameOf(s), t, ct);
+			return false;
+		}
+		queue[s] = { T_T, T_CT, rno };
+		dbg("[DEATH] slot %d (%s) %s died CT | T=%d CT=%d gap=%d > lim=%d | MARKED for T (round %d)",
+			s, nameOf(s), tier(s), t, ct, (ct - t), lim, rno);
+		Msg("%s marked %d: CT->T (round %d)\n", TAG, s, rno);
+		return true;
+	}
+
+	dbg("[DEATH] slot %d (%s) died %s | T=%d CT=%d gap=%d <= lim=%d | NOT marked",
+		s, nameOf(s), sideName(side), t, ct, abs(t - ct), lim);
+	return false;
+}
+
+static void gateSwap(const char*, IGameEvent* e, bool)
+{
+	if (!e || !g_pPlayers || !g_pUtils) return;
+
+	const int  s  = e->GetInt("userid");
+	const int  nt = e->GetInt("team");
+	const int  ot = e->GetInt("oldteam");
+	const bool dc = e->GetBool("disconnect");
+
+	if (!slotOk(s))                  return;
+	if (g_pPlayers->IsFakeClient(s)) return;
+	if (dc)                          return;
+	if (nt <= T_SPEC)                return;
+	if (ot <= T_SPEC)                return;
+	if (nt == ot)                    return;
+
+	if (selfNudge[s])
+	{
+		selfNudge[s] = false;
 		return;
 	}
 
 	int t, ct;
-	GetCounts(t, ct, slot);
+	headCount(t, ct, s);
+	if (nt == T_T)       ++t;
+	else if (nt == T_CT) ++ct;
 
-	if (newTeam == 2) t++;
-	else if (newTeam == 3) ct++;
-	
-	int diff = abs(t - ct);
-	int maxDiff = g_iBlock;
-	
-	if (HasAdminPermission(slot))
-		maxDiff = g_iAdminBlock;
-	else if (HasVIPImmunity(slot))
-		maxDiff = g_iVIPBlock;
-	
-	if (diff > maxDiff)
+	const int gap = abs(t - ct);
+	const int lim = swapLimit(s);
+
+	if (gap > lim)
 	{
-		g_pPlayers->SwitchTeam(slot, oldTeam);
-		
-		if (g_bDebug)
-		{
-			const char* playerName = g_pPlayers->GetPlayerName(slot);
-			LogFAB("[BLOCK] slot %d (%s) tried %s->%s | Would be T=%d CT=%d diff=%d > maxDiff=%d | BLOCKED",
-				slot, playerName ? playerName : "Unknown",
-				oldTeam == 2 ? "T" : "CT",
-				newTeam == 2 ? "T" : "CT",
-				t, ct, diff, maxDiff);
-		}
-		
-		if (g_bShowMsg)
-		{
-			const char* msg = GetTranslation("FAB_Block");
-			g_pUtils->PrintToChat(slot, " %s", msg);
-		}
+		vetoMark[s] = true;
+		lazyMove(s, ot);
+
+		dbg("[VETO] slot %d (%s) %s tried %s->%s | would be T=%d CT=%d gap=%d > lim=%d | BLOCKED",
+			s, nameOf(s), tier(s), sideName(ot), sideName(nt), t, ct, gap, lim);
+
+		if (cfg.yapAtPlayer)
+			g_pUtils->PrintToChat(s, " %s", phrase("FAB_Block"));
 	}
-	else if (g_bDebug)
+	else
 	{
-		const char* playerName = g_pPlayers->GetPlayerName(slot);
-		LogFAB("[ALLOW] slot %d (%s) switch %s->%s | Will be T=%d CT=%d diff=%d <= maxDiff=%d | ALLOWED",
-			slot, playerName ? playerName : "Unknown",
-			oldTeam == 2 ? "T" : "CT",
-			newTeam == 2 ? "T" : "CT",
-			t, ct, diff, maxDiff);
+		dbg("[OK]   slot %d (%s) %s switch %s->%s | will be T=%d CT=%d gap=%d <= lim=%d | ALLOW",
+			s, nameOf(s), tier(s), sideName(ot), sideName(nt), t, ct, gap, lim);
 	}
 }
 
-void OnPlayerTeam(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+static void noteSwap(const char*, IGameEvent* e, bool)
 {
-	if (!pEvent) return;
-	int slot = pEvent->GetInt("userid");
-	int team = pEvent->GetInt("team");
-	int oldTeam = pEvent->GetInt("oldteam");
-	
-	if (slot < 0 || slot >= 64) return;
-	
-	int prevCached = g_iTeam[slot];
-	g_iTeam[slot] = team;
-	
-	if (team <= 1 && oldTeam >= 2)
+	if (!e) return;
+	const int s  = e->GetInt("userid");
+	const int nt = e->GetInt("team");
+	const int ot = e->GetInt("oldteam");
+	if (!slotOk(s)) return;
+
+	if (vetoMark[s])
 	{
-		auto it = g_PendingBalance.find(slot);
-		if (it != g_PendingBalance.end())
+		vetoMark[s] = false;
+		dbg("[TEAM] slot %d (%s) %d->%d | (vetoed, skip)",
+			s, nameOf(s), ot, nt);
+		return;
+	}
+
+	const int prev = slotTeam[s];
+	slotTeam[s] = nt;
+
+	auto it = queue.find(s);
+	if (it != queue.end())
+	{
+		const bool gone =
+			(nt <= T_SPEC) ||
+			(nt != it->second.src);
+		if (gone)
 		{
-			g_PendingBalance.erase(slot);
-			if (g_bDebug)
-			{
-				const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : "Unknown";
-				LogFAB("[TEAM] slot %d (%s) went to SPEC (was %s) | REMOVED from pending",
-					slot, playerName ? playerName : "Unknown",
-					oldTeam == 2 ? "T" : "CT");
-			}
-		}
-		
-		if (g_bDebug && prevCached >= 2)
-		{
-			const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : "Unknown";
-			int t, ct;
-			GetCounts(t, ct);
-			LogFAB("[TEAM] slot %d (%s) %s->SPEC | Now: T=%d CT=%d",
-				slot, playerName ? playerName : "Unknown",
-				oldTeam == 2 ? "T" : "CT", t, ct);
+			dbg("[TEAM] slot %d (%s) %s->%s | was queued->%s | DROPPED",
+				s, nameOf(s), sideName(ot), sideName(nt),
+				sideName(it->second.dst));
+			queue.erase(it);
 		}
 	}
-	else if (g_bDebug)
+
+	if (cfg.noisy)
 	{
-		const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : "Unknown";
 		int t, ct;
-		GetCounts(t, ct);
-		LogFAB("[TEAM] slot %d (%s) %d->%d | Now: T=%d CT=%d",
-			slot, playerName ? playerName : "Unknown",
-			oldTeam, team, t, ct);
+		headCount(t, ct);
+		dbg("[TEAM] slot %d (%s) %s->%s | now T=%d CT=%d (cached %d)",
+			s, nameOf(s), sideName(ot), sideName(nt), t, ct, prev);
 	}
 }
 
-void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+static void onDeath(const char*, IGameEvent* e, bool)
 {
-	if (!pEvent || !g_pPlayers || !g_pUtils) return;
-	
-	int slot = pEvent->GetInt("userid");
-	if (slot < 0 || slot >= 64) return;
-	if (!g_pPlayers->IsConnected(slot) || g_pPlayers->IsFakeClient(slot)) return;
-	
-	int team = g_iTeam[slot];
-	
-	if (team <= 1) return;
-	
+	if (!e) return;
+
+	const int s = e->GetInt("userid");
+	if (!slotOk(s))    return;
+	if (!realDude(s))  return;
+
+	const int side = slotTeam[s];
+	if (side != T_T && side != T_CT) return;
+
 	int t, ct;
-	GetCounts(t, ct);
-	
-	if (team == 2) t--;
-	else if (team == 3) ct--;
-	
-	int maxDiff = g_iMaxAD;
-	if (HasAdminPermission(slot))
-		maxDiff = g_iAdminMax;
-	else if (HasVIPImmunity(slot))
-		maxDiff = g_iVIPMax;
-	
-	if (t > ct && (t - ct) > maxDiff && team == 2)
+	headCount(t, ct);
+	if (side == T_T)       --t;
+	else                   --ct;
+
+	tagDeath(s, t, ct, side);
+}
+
+static void wipeStaleMark(const char*, IGameEvent* e, bool)
+{
+	if (!e) return;
+	const int s = e->GetInt("userid");
+	if (!slotOk(s)) return;
+
+	auto it = queue.find(s);
+	if (it != queue.end())
 	{
-		if (t <= 0)
-		{
-			if (g_bDebug)
-			{
-				const char* playerName = g_pPlayers->GetPlayerName(slot);
-				LogFAB("[DEATH] slot %d (%s) died in T | T=%d CT=%d | SAFETY: Would create empty T team | NOT marked",
-					slot, playerName ? playerName : "Unknown", t, ct);
-			}
-			return;
-		}
-		
-		PendingBalance pending;
-		pending.targetTeam = 3;
-		pending.deathTeam = 2;
-		pending.deathRound = g_iCurrentRound;
-		g_PendingBalance[slot] = pending;
-		
-		if (g_bDebug)
-		{
-			const char* playerName = g_pPlayers->GetPlayerName(slot);
-			const char* playerType = HasAdminPermission(slot) ? "Admin" : (HasVIPImmunity(slot) ? "VIP" : "Player");
-			LogFAB("[DEATH] slot %d (%s) %s died in T | AFTER death: T=%d CT=%d diff=%d > maxDiff=%d | MARKED for CT (round %d)",
-				slot, playerName ? playerName : "Unknown", playerType,
-				t, ct, abs(t - ct), maxDiff, g_iCurrentRound);
-		}
-		
-		Msg("[FAB] Marked slot %d for balance: T->CT (round %d)\n", slot, g_iCurrentRound);
-	}
-	else if (ct > t && (ct - t) > maxDiff && team == 3)
-	{
-		if (ct <= 0)
-		{
-			if (g_bDebug)
-			{
-				const char* playerName = g_pPlayers->GetPlayerName(slot);
-				LogFAB("[DEATH] slot %d (%s) died in CT | T=%d CT=%d | SAFETY: Would create empty CT team | NOT marked",
-					slot, playerName ? playerName : "Unknown", t, ct);
-			}
-			return;
-		}
-		
-		PendingBalance pending;
-		pending.targetTeam = 2;
-		pending.deathTeam = 3;
-		pending.deathRound = g_iCurrentRound;
-		g_PendingBalance[slot] = pending;
-		
-		if (g_bDebug)
-		{
-			const char* playerName = g_pPlayers->GetPlayerName(slot);
-			const char* playerType = HasAdminPermission(slot) ? "Admin" : (HasVIPImmunity(slot) ? "VIP" : "Player");
-			LogFAB("[DEATH] slot %d (%s) %s died in CT | AFTER death: T=%d CT=%d diff=%d > maxDiff=%d | MARKED for T (round %d)",
-				slot, playerName ? playerName : "Unknown", playerType,
-				t, ct, abs(ct - t), maxDiff, g_iCurrentRound);
-		}
-		
-		Msg("[FAB] Marked slot %d for balance: CT->T (round %d)\n", slot, g_iCurrentRound);
-	}
-	else if (g_bDebug)
-	{
-		const char* playerName = g_pPlayers->GetPlayerName(slot);
-		LogFAB("[DEATH] slot %d (%s) died in %s | AFTER death: T=%d CT=%d diff=%d <= maxDiff=%d | NOT marked",
-			slot, playerName ? playerName : "Unknown",
-			team == 2 ? "T" : "CT",
-			t, ct, abs(t - ct), maxDiff);
+		dbg("[SPAWN] slot %d (%s) | still queued->%s on spawn | DROPPED",
+			s, nameOf(s), sideName(it->second.dst));
+		queue.erase(it);
 	}
 }
 
-void OnPlayerSpawn(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+static void flushQueue(const char*, IGameEvent*, bool)
 {
-	if (!pEvent || !g_pPlayers || !g_pUtils) return;
-	
-	int slot = pEvent->GetInt("userid");
-	if (slot < 0 || slot >= 64) return;
-	
-	auto it = g_PendingBalance.find(slot);
-	if (it != g_PendingBalance.end())
-	{
-		if (g_bDebug)
-		{
-			const char* playerName = g_pPlayers->GetPlayerName(slot);
-			const char* toTeam = it->second.targetTeam == 2 ? "T" : "CT";
-			
-			LogFAB("[SPAWN] slot %d (%s) | WARNING: Still in pending (target %s) | REMOVED (should have been transferred on round_start)",
-				slot, playerName ? playerName : "Unknown", toTeam);
-		}
-		
-		g_PendingBalance.erase(slot);
-	}
-}
+	++rno;
 
-void OnRoundStart(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
-{
-	g_iCurrentRound++;
-	
-	int pendingCount = (int)g_PendingBalance.size();
-	
 	int t, ct;
-	GetCounts(t, ct);
-	
-	if (g_bDebug)
+	headCount(t, ct);
+	const int q = (int)queue.size();
+
+	dbg("[ROUND] %d started | T=%d CT=%d gap=%d | q=%d", rno, t, ct, abs(t - ct), q);
+	Msg("%s round %d started\n", TAG, rno);
+
+	if (q == 0) return;
+
+	std::vector<int> ids;
+	ids.reserve(queue.size());
+	for (const auto& kv : queue) ids.push_back(kv.first);
+
+	for (int s : ids)
 	{
-		LogFAB("[ROUND] Round %d started | T=%d CT=%d diff=%d | %d player(s) pending balance",
-			g_iCurrentRound, t, ct, abs(t - ct), pendingCount);
-	}
-	
-	Msg("[FAB] Round %d started\n", g_iCurrentRound);
-	
-	if (pendingCount > 0)
-	{
-		std::vector<int> pendingSlots;
-		for (const auto& pair : g_PendingBalance)
+		auto it = queue.find(s);
+		if (it == queue.end()) continue;
+
+		const Marked m = it->second;
+
+		if (!realDude(s))
 		{
-			pendingSlots.push_back(pair.first);
+			dbg("[ROUND] slot %d (%s) | not active | DROPPED", s, nameOf(s));
+			queue.erase(s);
+			continue;
 		}
-		
-		for (int slot : pendingSlots)
+
+		const int cur = slotTeam[s];
+		if (cur != m.src)
 		{
-			auto it = g_PendingBalance.find(slot);
-			if (it == g_PendingBalance.end())
-				continue;
-			
-			PendingBalance pending = it->second;
-			const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : "Unknown";
-			
-			if (!g_pPlayers || !g_pPlayers->IsConnected(slot) || g_pPlayers->IsFakeClient(slot))
-			{
-				g_PendingBalance.erase(slot);
-				if (g_bDebug)
-				{
-					LogFAB("[ROUND] slot %d (%s) | CHECK FAILED: not connected | REMOVED from pending",
-						slot, playerName ? playerName : "Unknown");
-				}
-				continue;
-			}
-			
-			int currentTeam = g_iTeam[slot];
-			
-			if (currentTeam != pending.deathTeam)
-			{
-				g_PendingBalance.erase(slot);
-				if (g_bDebug)
-				{
-					LogFAB("[ROUND] slot %d (%s) | CHECK FAILED: team changed (now %s, died in %s) | REMOVED from pending",
-						slot, playerName ? playerName : "Unknown",
-						currentTeam == 2 ? "T" : (currentTeam == 3 ? "CT" : "SPEC"),
-						pending.deathTeam == 2 ? "T" : "CT");
-				}
-				continue;
-			}
-			
-			int t_now, ct_now;
-			GetCounts(t_now, ct_now);
-			
-			if (t_now <= 1 || ct_now <= 1)
-			{
-				g_PendingBalance.erase(slot);
-				if (g_bDebug)
-				{
-					LogFAB("[ROUND] slot %d (%s) | SAFETY: One team too small (T=%d CT=%d) | NOT transferred",
-						slot, playerName ? playerName : "Unknown", t_now, ct_now);
-				}
-				continue;
-			}
-			
-			int maxDiff = g_iMaxAD;
-			bool isAdmin = HasAdminPermission(slot);
-			bool isVIP = HasVIPImmunity(slot);
-			
-			if (isAdmin)
-				maxDiff = g_iAdminMax;
-			else if (isVIP)
-				maxDiff = g_iVIPMax;
-			
-			const char* playerType = isAdmin ? "Admin" : (isVIP ? "VIP" : "Player");
-			
-			bool needBalance = false;
-			int currentDiff = abs(t_now - ct_now);
-			
-			if (pending.targetTeam == 3)
-			{
-				if (t_now > ct_now && (t_now - ct_now) > maxDiff)
-					needBalance = true;
-			}
-			else if (pending.targetTeam == 2)
-			{
-				if (ct_now > t_now && (ct_now - t_now) > maxDiff)
-					needBalance = true;
-			}
-			
-			if (!needBalance)
-			{
-				g_PendingBalance.erase(slot);
-				if (g_bDebug)
-				{
-					LogFAB("[ROUND] slot %d (%s) %s | T=%d CT=%d diff=%d <= maxDiff=%d | BALANCE NOT NEEDED | REMOVED from pending",
-						slot, playerName ? playerName : "Unknown", playerType,
-						t_now, ct_now, currentDiff, maxDiff);
-				}
-				continue;
-			}
-			
-			int t_after = t_now;
-			int ct_after = ct_now;
-			
-			if (pending.targetTeam == 3)
-			{
-				t_after = t_now - 1;
-				ct_after = ct_now + 1;
-			}
-			else if (pending.targetTeam == 2)
-			{
-				t_after = t_now + 1;
-				ct_after = ct_now - 1;
-			}
-			
-			if (t_after <= 0 || ct_after <= 0)
-			{
-				g_PendingBalance.erase(slot);
-				if (g_bDebug)
-				{
-					LogFAB("[ROUND] slot %d (%s) %s | SAFETY: Would create empty team (T=%d CT=%d after transfer) | REMOVED from pending",
-						slot, playerName ? playerName : "Unknown", playerType,
-						t_after, ct_after);
-				}
-				continue;
-			}
-			
-			int diff_after = abs(t_after - ct_after);
-			
-			if (diff_after >= currentDiff)
-			{
-				g_PendingBalance.erase(slot);
-				if (g_bDebug)
-				{
-					LogFAB("[ROUND] slot %d (%s) %s | SAFETY: Would not improve balance (diff now=%d, after=%d) | REMOVED from pending",
-						slot, playerName ? playerName : "Unknown", playerType,
-						currentDiff, diff_after);
-				}
-				continue;
-			}
-			
-			const char* fromTeam = pending.deathTeam == 2 ? "T" : "CT";
-			const char* toTeam = pending.targetTeam == 2 ? "T" : "CT";
-			
-			g_bChangingTeam[slot] = true;
-			g_pPlayers->SwitchTeam(slot, pending.targetTeam);
-			g_iTeam[slot] = pending.targetTeam;
-			
-			if (g_bDebug)
-			{
-				LogFAB("[ROUND] slot %d (%s) %s | T=%d CT=%d diff=%d > maxDiff=%d | TRANSFERRED %s->%s | SUCCESS",
-					slot, playerName ? playerName : "Unknown", playerType,
-					t_now, ct_now, currentDiff, maxDiff, fromTeam, toTeam);
-			}
-			
-			Msg("[FAB] BALANCED: slot %d -> team %d (T=%d CT=%d)\n", 
-				slot, pending.targetTeam, t_now, ct_now);
-			
-			if (g_bShowMsg)
-			{
-				const char* msg = (pending.targetTeam == 3) ? 
-					GetTranslation("FAB_Chat_CT") : 
-					GetTranslation("FAB_Chat_T");
-				g_pUtils->PrintToChat(slot, " %s", msg);
-			}
-			
-			g_PendingBalance.erase(slot);
+			dbg("[ROUND] slot %d (%s) | side moved (now %s, died %s) | DROPPED",
+				s, nameOf(s), sideName(cur), sideName(m.src));
+			queue.erase(s);
+			continue;
 		}
+
+		int tn, ctn;
+		headCount(tn, ctn);
+
+		const int lim = dieLimit(s);
+		const char* tt = tier(s);
+
+		const bool dropToCT = (m.dst == T_CT && tn > ctn && (tn - ctn) > lim);
+		const bool dropToT  = (m.dst == T_T  && ctn > tn && (ctn - tn) > lim);
+
+		if (!dropToCT && !dropToT)
+		{
+			dbg("[ROUND] slot %d (%s) %s | T=%d CT=%d gap=%d <= lim=%d | not needed | DROPPED",
+				s, nameOf(s), tt, tn, ctn, abs(tn - ctn), lim);
+			queue.erase(s);
+			continue;
+		}
+
+		const int ta = (m.dst == T_T)  ? tn + 1  : tn - 1;
+		const int ca = (m.dst == T_CT) ? ctn + 1 : ctn - 1;
+
+		if (ta <= 0 || ca <= 0)
+		{
+			dbg("[ROUND] slot %d (%s) %s | safety: empty side after (T=%d CT=%d) | DROPPED",
+				s, nameOf(s), tt, ta, ca);
+			queue.erase(s);
+			continue;
+		}
+
+		const int gn = abs(tn - ctn);
+		const int ga = abs(ta - ca);
+		if (ga >= gn)
+		{
+			dbg("[ROUND] slot %d (%s) %s | safety: gap stays (now=%d after=%d) | DROPPED",
+				s, nameOf(s), tt, gn, ga);
+			queue.erase(s);
+			continue;
+		}
+
+		lazyMove(s, m.dst);
+		slotTeam[s] = m.dst;
+
+		dbg("[ROUND] slot %d (%s) %s | T=%d CT=%d gap=%d > lim=%d | FLIPPED %s->%s",
+			s, nameOf(s), tt, tn, ctn, gn, lim, sideName(m.src), sideName(m.dst));
+		Msg("%s flipped %d -> team %d (T=%d CT=%d)\n", TAG, s, m.dst, tn, ctn);
+
+		if (cfg.yapAtPlayer && g_pUtils)
+		{
+			const char* msg = (m.dst == T_CT)
+				? phrase("FAB_Chat_CT")
+				: phrase("FAB_Chat_T");
+			g_pUtils->PrintToChat(s, " %s", msg);
+		}
+
+		queue.erase(s);
 	}
 }
 
-void OnPlayerConnect(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+static void wireSlot(const char*, IGameEvent* e, bool)
 {
-	if (!pEvent) return;
-	int slot = pEvent->GetInt("userid");
-	if (slot >= 0 && slot < 64)
-	{
-		g_iTeam[slot] = 0;
-		g_bChangingTeam[slot] = false;
-	}
+	if (!e) return;
+	const int s = e->GetInt("userid");
+	if (!slotOk(s)) return;
+
+	slotTeam[s]  = 0;
+	selfNudge[s] = false;
+	vetoMark[s]  = false;
 }
 
-void OnPlayerDisconnect(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+static void unwireSlot(const char*, IGameEvent* e, bool)
 {
-	if (!pEvent) return;
-	int slot = pEvent->GetInt("userid");
-	if (slot >= 0 && slot < 64)
+	if (!e) return;
+	const int s = e->GetInt("userid");
+	if (!slotOk(s)) return;
+
+	auto it = queue.find(s);
+	if (it != queue.end())
 	{
-		auto it = g_PendingBalance.find(slot);
-		if (it != g_PendingBalance.end())
-		{
-			if (g_bDebug)
-			{
-				const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : "Unknown";
-				const char* toTeam = it->second.targetTeam == 2 ? "T" : "CT";
-				
-				LogFAB("[DISCONNECT] slot %d (%s) disconnected | Was marked for %s | REMOVED from pending",
-					slot, playerName ? playerName : "Unknown", toTeam);
-			}
-			
-			g_PendingBalance.erase(slot);
-			Msg("[FAB] Removed slot %d from pending: disconnected\n", slot);
-		}
-		
-		g_iTeam[slot] = 0;
-		g_bChangingTeam[slot] = false;
+		dbg("[DC] slot %d (%s) | was queued->%s | DROPPED",
+			s, nameOf(s), sideName(it->second.dst));
+		queue.erase(it);
+		Msg("%s dropped %d: dc\n", TAG, s);
 	}
+
+	slotTeam[s]  = 0;
+	selfNudge[s] = false;
+	vetoMark[s]  = false;
 }
 
-bool OnReloadCommand(int iSlot, const char* szContent)
+static bool reloadCmd(int s, const char*)
 {
-	LoadConfig();
-	LoadTranslations();
-	
-	if (g_bDebug)
-	{
-		const char* playerName = g_pPlayers ? g_pPlayers->GetPlayerName(iSlot) : "Unknown";
-		LogFAB("[RELOAD] Config reloaded by slot %d (%s)", iSlot, playerName ? playerName : "Unknown");
-	}
-	
-	g_pUtils->PrintToChat(iSlot, " \x0B[FAB] \x04Config and translations reloaded!");
+	pullCfg();
+	pullPhrases();
+	killNative();
+
+	dbg("[RELOAD] reloaded by slot %d (%s)", s, nameOf(s));
+
+	if (g_pUtils)
+		g_pUtils->PrintToChat(s, " \x0B%s \x04reloaded", TAG);
 	return true;
 }
 
-void OnStartupServer()
+static void bootHooks()
 {
-	LoadConfig();
-	LoadTranslations();
-	g_iCurrentRound = 0;
-	g_PendingBalance.clear();
-	
-	for (int i = 0; i < 64; i++)
+	g_pGameEntitySystem = g_pUtils ? g_pUtils->GetCGameEntitySystem() : nullptr;
+	g_pEntitySystem     = g_pUtils ? g_pUtils->GetCEntitySystem()     : nullptr;
+	gpGlobals           = g_pUtils ? g_pUtils->GetCGlobalVars()       : nullptr;
+
+	pullCfg();
+	pullPhrases();
+	killNative();
+
+	rno = 0;
+	queue.clear();
+	for (int i = 0; i < MAX_SLOTS; ++i)
 	{
-		g_iTeam[i] = 0;
-		g_bChangingTeam[i] = false;
+		slotTeam[i]  = 0;
+		selfNudge[i] = false;
+		vetoMark[i]  = false;
 	}
-	
-	if (g_bDebug)
+
+	if (cfg.noisy)
 	{
-		LogFAB("========================================");
-		LogFAB("[SERVER] FastAutoBalance v1.3.4 started");
-		LogFAB("========================================");
+		dbg("========================================");
+		dbg("[BOOT] FastAutoBalance v%s up", VER);
+		dbg("========================================");
 	}
 }
 
 bool FastAutoBalance::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late)
 {
 	PLUGIN_SAVEVARS();
-	
-	GET_V_IFACE_CURRENT(GetEngineFactory, engine, IVEngineServer2, SOURCE2ENGINETOSERVER_INTERFACE_VERSION);
-	GET_V_IFACE_CURRENT(GetFileSystemFactory, filesystem, IFileSystem, FILESYSTEM_INTERFACE_VERSION);
-	
-	Msg("[FAB] Loading v1.3.4...\n");	return true;
+
+	GET_V_IFACE_CURRENT(GetEngineFactory,     engine,     IVEngineServer2, SOURCE2ENGINETOSERVER_INTERFACE_VERSION);
+	GET_V_IFACE_CURRENT(GetFileSystemFactory, filesystem, IFileSystem,     FILESYSTEM_INTERFACE_VERSION);
+
+	g_SMAPI->AddListener(this, this);
+
+	Msg("%s v%s loading...\n", TAG, VER);
+	return true;
 }
 
-bool FastAutoBalance::Unload(char *error, size_t maxlen)
+bool FastAutoBalance::Unload(char*, size_t)
 {
 	if (g_pUtils) g_pUtils->ClearAllHooks(g_PLID);
-	
-	g_Phrases.clear();
-	g_vecVIPGroups.clear();
-	g_PendingBalance.clear();
-	
-	Msg("[FAB] Unloaded\n");
-	
+
+	loc.clear();
+	cfg.vipBands.clear();
+	queue.clear();
+
+	Msg("%s bye\n", TAG);
 	return true;
 }
 
 void FastAutoBalance::AllPluginsLoaded()
 {
-	Msg("[FAB] AllPluginsLoaded() v1.3.4\n");
-	
+	Msg("%s AllPluginsLoaded() v%s\n", TAG, VER);
+
 	int ret;
-	
+
 	g_pUtils = (IUtilsApi*)g_SMAPI->MetaFactory(Utils_INTERFACE, &ret, NULL);
-	if (ret == META_IFACE_FAILED)
+	if (ret == META_IFACE_FAILED || !g_pUtils)
 	{
-		Msg("[FAB] ERROR: Utils API not found\n");
+		Msg("%s ERR: Utils API missing\n", TAG);
 		return;
 	}
-	
+
 	g_pPlayers = (IPlayersApi*)g_SMAPI->MetaFactory(PLAYERS_INTERFACE, &ret, NULL);
-	if (ret == META_IFACE_FAILED)
+	if (ret == META_IFACE_FAILED || !g_pPlayers)
 	{
-		Msg("[FAB] ERROR: Players API not found\n");
+		Msg("%s ERR: Players API missing\n", TAG);
 		return;
 	}
-	
+
 	g_pVIPCore = (IVIPApi*)g_SMAPI->MetaFactory(VIP_INTERFACE, &ret, NULL);
-	if (ret == META_IFACE_FAILED)
-	{
-		g_pVIPCore = nullptr;
-		Msg("[FAB] VIP API not found (optional)\n");
-	}
-	
+	if (ret == META_IFACE_FAILED) { g_pVIPCore = nullptr; Msg("%s VIP API skipped\n", TAG); }
+
 	g_pAdminCore = (IAdminApi*)g_SMAPI->MetaFactory(Admin_INTERFACE, &ret, NULL);
-	if (ret == META_IFACE_FAILED)
+	if (ret == META_IFACE_FAILED) { g_pAdminCore = nullptr; Msg("%s Admin API skipped\n", TAG); }
+
+	for (int i = 0; i < MAX_SLOTS; ++i)
 	{
-		g_pAdminCore = nullptr;
-		Msg("[FAB] Admin API not found (optional)\n");
+		slotTeam[i]  = 0;
+		selfNudge[i] = false;
+		vetoMark[i]  = false;
 	}
-	
-	for (int i = 0; i < 64; i++)
-	{
-		g_iTeam[i] = 0;
-		g_bChangingTeam[i] = false;
-	}
-	
-	g_pUtils->StartupServer(g_PLID, OnStartupServer);
-	
-	Msg("[FAB] Hooking events...\n");
-	g_pUtils->HookEvent(g_PLID, "player_team",           OnPlayerTeamPre);
-	g_pUtils->HookEvent(g_PLID, "player_team",           OnPlayerTeam);
-	g_pUtils->HookEvent(g_PLID, "player_death",          OnPlayerDeath);
-	g_pUtils->HookEvent(g_PLID, "player_spawn",          OnPlayerSpawn);
-	g_pUtils->HookEvent(g_PLID, "round_start",           OnRoundStart);
-	g_pUtils->HookEvent(g_PLID, "player_connect_full",   OnPlayerConnect);
-	g_pUtils->HookEvent(g_PLID, "player_disconnect",     OnPlayerDisconnect);
-	
-	g_pUtils->RegCommand(g_PLID, {"fab_reload"}, {}, OnReloadCommand);
-	
-	Msg("[FAB] Loaded successfully!\n");
+
+	g_pUtils->StartupServer(g_PLID, bootHooks);
+
+	Msg("%s wiring events...\n", TAG);
+	g_pUtils->HookEvent(g_PLID, "player_team",         gateSwap);
+	g_pUtils->HookEvent(g_PLID, "player_team",         noteSwap);
+	g_pUtils->HookEvent(g_PLID, "player_death",        onDeath);
+	g_pUtils->HookEvent(g_PLID, "player_spawn",        wipeStaleMark);
+	g_pUtils->HookEvent(g_PLID, "round_start",         flushQueue);
+	g_pUtils->HookEvent(g_PLID, "player_connect_full", wireSlot);
+	g_pUtils->HookEvent(g_PLID, "player_disconnect",   unwireSlot);
+
+	g_pUtils->RegCommand(g_PLID, { "fab_reload" }, {}, reloadCmd);
+
+	Msg("%s ready!\n", TAG);
 }
 
 /////////////////////////////////////////////////////////////////
@@ -788,7 +754,7 @@ const char *FastAutoBalance::GetLicense()
 
 const char *FastAutoBalance::GetVersion()
 {
-	return "1.3.4";
+	return "1.4.0";
 }
 
 const char *FastAutoBalance::GetDate()
