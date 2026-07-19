@@ -7,7 +7,7 @@
 #include "include/menus.h"
 #include "include/vip.h"
 #include "include/admin.h"
-#include "KeyValues.h"
+#include "keyvalues.h"
 #include "filesystem.h"
 
 #include <map>
