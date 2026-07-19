@@ -33,7 +33,7 @@ namespace
 	constexpr int T_T       = 2;
 	constexpr int T_CT      = 3;
 	constexpr const char* TAG = "[FAB]";
-	constexpr const char* VER = "2.1.0";
+	constexpr const char* VER = "2.2.0";
 
 	struct Cfg
 	{
@@ -379,7 +379,7 @@ static bool tagDeath(int s, int t, int ct, int side)
 	return false;
 }
 
-static void gateSwap(const char*, IGameEvent* e, bool)
+static void gateSwap(IGameEvent* e)
 {
 	if (!e || !g_pPlayers || !g_pUtils) return;
 
@@ -427,7 +427,7 @@ static void gateSwap(const char*, IGameEvent* e, bool)
 	}
 }
 
-static void noteSwap(const char*, IGameEvent* e, bool)
+static void noteSwap(IGameEvent* e)
 {
 	if (!e) return;
 	const int s  = e->GetInt("userid");
@@ -470,6 +470,12 @@ static void noteSwap(const char*, IGameEvent* e, bool)
 	}
 }
 
+static void onTeamEvent(const char*, IGameEvent* e, bool)
+{
+	gateSwap(e);
+	noteSwap(e);
+}
+
 static void onDeath(const char*, IGameEvent* e, bool)
 {
 	if (!e) return;
@@ -496,9 +502,11 @@ static void wipeStaleMark(const char*, IGameEvent* e, bool)
 	if (!slotOk(s)) return;
 
 	auto it = queue.find(s);
-	if (it != queue.end())
+	if (it == queue.end()) return;
+
+	if (it->second.rno == rno)
 	{
-		dbg("[SPAWN] slot %d (%s) | still queued->%s on spawn | DROPPED",
+		dbg("[SPAWN] slot %d (%s) | respawned same round | queued->%s DROPPED",
 			s, nameOf(s), sideName(it->second.dst));
 		queue.erase(it);
 	}
@@ -601,6 +609,20 @@ static void flushQueue(const char*, IGameEvent*, bool)
 	}
 }
 
+static bool didPrestart = false;
+
+static void onRoundPrestart(const char*, IGameEvent*, bool)
+{
+	didPrestart = true;
+	flushQueue(nullptr, nullptr, false);
+}
+
+static void onRoundStart(const char*, IGameEvent*, bool)
+{
+	if (didPrestart) { didPrestart = false; return; }
+	flushQueue(nullptr, nullptr, false);
+}
+
 static void wireSlot(const char*, IGameEvent* e, bool)
 {
 	if (!e) return;
@@ -656,6 +678,7 @@ static void bootHooks()
 	killNative();
 
 	rno = 0;
+	didPrestart = false;
 	queue.clear();
 	for (int i = 0; i < MAX_SLOTS; ++i)
 	{
@@ -733,11 +756,11 @@ void FastAutoBalance::AllPluginsLoaded()
 	g_pUtils->StartupServer(g_PLID, bootHooks);
 
 	Msg("%s wiring events...\n", TAG);
-	g_pUtils->HookEvent(g_PLID, "player_team",         gateSwap);
-	g_pUtils->HookEvent(g_PLID, "player_team",         noteSwap);
+	g_pUtils->HookEvent(g_PLID, "player_team",         onTeamEvent);
 	g_pUtils->HookEvent(g_PLID, "player_death",        onDeath);
 	g_pUtils->HookEvent(g_PLID, "player_spawn",        wipeStaleMark);
-	g_pUtils->HookEvent(g_PLID, "round_start",         flushQueue);
+	g_pUtils->HookEvent(g_PLID, "round_prestart",      onRoundPrestart);
+	g_pUtils->HookEvent(g_PLID, "round_start",         onRoundStart);
 	g_pUtils->HookEvent(g_PLID, "player_connect_full", wireSlot);
 	g_pUtils->HookEvent(g_PLID, "player_disconnect",   unwireSlot);
 
@@ -754,7 +777,7 @@ const char *FastAutoBalance::GetLicense()
 
 const char *FastAutoBalance::GetVersion()
 {
-	return "1.4.0";
+	return "2.2.0";
 }
 
 const char *FastAutoBalance::GetDate()
