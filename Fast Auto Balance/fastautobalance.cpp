@@ -33,7 +33,7 @@ namespace
 	constexpr int T_T       = 2;
 	constexpr int T_CT      = 3;
 	constexpr const char* TAG = "[FAB]";
-	constexpr const char* VER = "2.2.0";
+	constexpr const char* VER = "2.3.0";
 
 	struct Cfg
 	{
@@ -225,15 +225,18 @@ static const char* phrase(const char* k)
 	return k;
 }
 
-static void lazyMove(int s, int dst)
+static void lazyMove(int s, int dst, bool bHard = false)
 {
 	if (!g_pUtils || !g_pPlayers) return;
 
-	g_pUtils->CreateTimer(0.1f, [s, dst]() -> float {
+	g_pUtils->CreateTimer(0.1f, [s, dst, bHard]() -> float {
 		if (!g_pPlayers || !g_pPlayers->IsConnected(s))
 			return -1.0f;
 		selfNudge[s] = true;
-		g_pPlayers->SwitchTeam(s, dst);
+		if (bHard)
+			g_pPlayers->ChangeTeam(s, dst);
+		else
+			g_pPlayers->SwitchTeam(s, dst);
 		return -1.0f;
 	});
 }
@@ -412,7 +415,7 @@ static void gateSwap(IGameEvent* e)
 	if (gap > lim)
 	{
 		vetoMark[s] = true;
-		lazyMove(s, ot);
+		lazyMove(s, ot, true);
 
 		dbg("[VETO] slot %d (%s) %s tried %s->%s | would be T=%d CT=%d gap=%d > lim=%d | BLOCKED",
 			s, nameOf(s), tier(s), sideName(ot), sideName(nt), t, ct, gap, lim);
@@ -777,7 +780,7 @@ const char *FastAutoBalance::GetLicense()
 
 const char *FastAutoBalance::GetVersion()
 {
-	return "2.2.0";
+	return "2.3.0";
 }
 
 const char *FastAutoBalance::GetDate()
