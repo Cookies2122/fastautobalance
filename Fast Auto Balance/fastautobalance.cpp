@@ -1,814 +1,803 @@
 #include "fastautobalance.h"
-
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cerrno>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 FastAutoBalance g_FastAutoBalance;
 PLUGIN_EXPOSE(FastAutoBalance, g_FastAutoBalance);
-PLUGIN_GLOBALVARS();
 
-IUtilsApi*       g_pUtils       = nullptr;
-IPlayersApi*     g_pPlayers     = nullptr;
-IVIPApi*         g_pVIPCore     = nullptr;
-IAdminApi*       g_pAdminCore   = nullptr;
-IVEngineServer2* engine         = nullptr;
-IFileSystem*     filesystem     = nullptr;
+IUtilsApi* g_pUtils = nullptr;
+IPlayersApi* g_pPlayers = nullptr;
+IVIPApi* g_pVIPCore = nullptr;
+IAdminApi* g_pAdminCore = nullptr;
+IVEngineServer2* engine = nullptr;
+IFileSystem* filesystem = nullptr;
+ISource2GameClients* g_pGameClients = nullptr;
 
 CGameEntitySystem* g_pGameEntitySystem = nullptr;
-CEntitySystem*     g_pEntitySystem     = nullptr;
-CGlobalVars*       gpGlobals           = nullptr;
+CEntitySystem* g_pEntitySystem = nullptr;
+CGlobalVars* gpGlobals = nullptr;
+
+SH_DECL_HOOK2_void(ISource2GameClients, ClientCommand, SH_NOATTRIB, 0, CPlayerSlot, const CCommand&);
+
+struct BalanceInfo
+{
+	int iNewTeam;
+	int iOldTeam;
+	int iRound;
+};
+
+int g_iMaxDiff;
+int g_iBlockDiff;
+bool g_bMessage;
+bool g_bDebug;
+bool g_bForceNativeOff;
+
+bool g_bAdminImmunity;
+std::string g_sAdminFlag;
+int g_iAdminMaxDiff;
+int g_iAdminBlockDiff;
+
+bool g_bVipImmunity;
+std::vector<std::string> g_vecVipGroups;
+int g_iVipMaxDiff;
+int g_iVipBlockDiff;
+
+int g_iTeam[64];
+bool g_bAlive[64];
+bool g_bPluginMove[64];
+time_t g_iBlockMsgTime[64];
+int g_iBlockMsgSkip[64];
+
+std::map<int, BalanceInfo> g_Queue;
+int g_iRound = 0;
+bool g_bPrestart = false;
+bool g_bLateLoad = false;
+CTimer* g_pCheckTimer = nullptr;
+
+std::map<std::string, std::string> g_vecPhrases;
 
 CGameEntitySystem* GameEntitySystem()
 {
 	return g_pUtils ? g_pUtils->GetCGameEntitySystem() : nullptr;
 }
 
-namespace
+const char* GetTeamName(int iTeam)
 {
-	constexpr int MAX_SLOTS = 64;
-	constexpr int T_SPEC    = 1;
-	constexpr int T_T       = 2;
-	constexpr int T_CT      = 3;
-	constexpr const char* TAG = "[FAB]";
-	constexpr const char* VER = "2.3.0";
-
-	struct Cfg
+	switch (iTeam)
 	{
-		int  dieGap         = 2;
-		int  swapGap        = 1;
-		bool yapAtPlayer    = true;
-		bool noisy          = false;
-		bool muteNative     = true;
-
-		bool admShield      = true;
-		std::string admPerm = "@admin/balance";
-		int  admDieGap      = 3;
-		int  admSwapGap     = 2;
-
-		bool vipShield      = true;
-		std::vector<std::string> vipBands;
-		int  vipDieGap      = 3;
-		int  vipSwapGap     = 2;
-	};
-
-	Cfg cfg;
-
-	int  slotTeam[MAX_SLOTS]  = {0};
-	bool selfNudge[MAX_SLOTS] = {false};
-	bool vetoMark[MAX_SLOTS]  = {false};
-
-	struct Marked
-	{
-		int dst;
-		int src;
-		int rno;
-	};
-
-	std::map<int, Marked> queue;
-	int rno = 0;
-
-	std::map<std::string, std::string> loc;
-}
-
-static bool slotOk(int s) { return s >= 0 && s < MAX_SLOTS; }
-
-static bool realDude(int s)
-{
-	return g_pPlayers
-		&& g_pPlayers->IsConnected(s)
-		&& !g_pPlayers->IsFakeClient(s);
-}
-
-static const char* sideName(int t)
-{
-	if (t == T_T)    return "T";
-	if (t == T_CT)   return "CT";
-	if (t == T_SPEC) return "SPEC";
+		case 1: return "SPEC";
+		case 2: return "T";
+		case 3: return "CT";
+	}
 	return "NONE";
 }
 
-static const char* nameOf(int s)
+bool IsValidPlayer(int iSlot)
 {
-	const char* n = g_pPlayers ? g_pPlayers->GetPlayerName(s) : nullptr;
-	return (n && n[0]) ? n : "Unknown";
+	if (iSlot < 0 || iSlot >= 64 || !g_pPlayers)
+		return false;
+	return g_pPlayers->IsConnected(iSlot) && !g_pPlayers->IsFakeClient(iSlot);
 }
 
-static void mkLogDir()
+const char* GetClientName(int iSlot)
 {
-	if (filesystem) filesystem->CreateDirHierarchy("addons/logs/fab", "GAME");
+	const char* szName = g_pPlayers ? g_pPlayers->GetPlayerName(iSlot) : nullptr;
+	return (szName && szName[0]) ? szName : "Unknown";
 }
 
-static void dbg(const char* fmt, ...)
+void ResetPlayer(int iSlot)
 {
-	if (!cfg.noisy) return;
+	g_iTeam[iSlot] = 0;
+	g_bAlive[iSlot] = false;
+	g_bPluginMove[iSlot] = false;
+	g_iBlockMsgTime[iSlot] = 0;
+	g_iBlockMsgSkip[iSlot] = 0;
+}
 
-	mkLogDir();
-
-	time_t raw = time(nullptr);
-	struct tm tmNow;
+bool CreateDir(const char* szPath)
+{
 #ifdef _WIN32
-	localtime_s(&tmNow, &raw);
+	return _mkdir(szPath) == 0 || errno == EEXIST;
 #else
-	localtime_r(&raw, &tmNow);
+	return mkdir(szPath, 0755) == 0 || errno == EEXIST;
 #endif
-
-	char d[32];
-	snprintf(d, sizeof(d), "%02d_%02d_%04d",
-		tmNow.tm_mday, tmNow.tm_mon + 1, tmNow.tm_year + 1900);
-
-	char p[512];
-	g_SMAPI->PathFormat(p, sizeof(p),
-		"%s/addons/logs/fab/fab_%s.txt", g_SMAPI->GetBaseDir(), d);
-
-	FILE* fp = fopen(p, "a");
-	if (!fp) return;
-
-	char tStr[16];
-	snprintf(tStr, sizeof(tStr), "%02d:%02d:%02d",
-		tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec);
-
-	char buf[1024];
-	va_list a;
-	va_start(a, fmt);
-	vsnprintf(buf, sizeof(buf), fmt, a);
-	va_end(a);
-
-	fprintf(fp, "[%s] %s\n", tStr, buf);
-	fclose(fp);
 }
 
-static std::vector<std::string> chopCsv(const std::string& s)
+void LogDebug(const char* szFormat, ...)
 {
-	std::vector<std::string> out;
-	size_t start = 0;
-	for (size_t i = 0; i <= s.length(); ++i)
+	if (!g_bDebug)
+		return;
+
+	static bool bError = false;
+	char szPath[512];
+
+	const char* szDirs[] = { "addons", "addons/logs", "addons/logs/fab" };
+	for (int i = 0; i < 3; i++)
 	{
-		if (i == s.length() || s[i] == ',')
+		g_SMAPI->PathFormat(szPath, sizeof(szPath), "%s/%s", g_SMAPI->GetBaseDir(), szDirs[i]);
+		if (!CreateDir(szPath))
 		{
-			size_t b = start, e = i;
-			while (b < e && (s[b] == ' ' || s[b] == '\t')) ++b;
-			while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t')) --e;
-			if (b < e) out.emplace_back(s.substr(b, e - b));
-			start = i + 1;
+			if (!bError)
+			{
+				bError = true;
+				Msg("[FAB] Failed to create %s (errno %d)\n", szPath, errno);
+			}
+			break;
 		}
 	}
-	return out;
+
+	time_t iTime = time(nullptr);
+	tm* pTime = localtime(&iTime);
+
+	g_SMAPI->PathFormat(szPath, sizeof(szPath), "%s/addons/logs/fab/fab_%02d_%02d_%04d.txt",
+		g_SMAPI->GetBaseDir(), pTime->tm_mday, pTime->tm_mon + 1, pTime->tm_year + 1900);
+
+	FILE* pFile = fopen(szPath, "a");
+	if (!pFile)
+	{
+		if (!bError)
+		{
+			bError = true;
+			Msg("[FAB] Failed to open %s (errno %d)\n", szPath, errno);
+		}
+		return;
+	}
+
+	char szBuffer[1024];
+	va_list args;
+	va_start(args, szFormat);
+	vsnprintf(szBuffer, sizeof(szBuffer), szFormat, args);
+	va_end(args);
+
+	fprintf(pFile, "[%02d:%02d:%02d] %s\n", pTime->tm_hour, pTime->tm_min, pTime->tm_sec, szBuffer);
+	fclose(pFile);
 }
 
-static void headCount(int& t, int& ct, int skip = -1)
+std::vector<std::string> SplitString(const std::string& sText)
 {
-	t = 0;
-	ct = 0;
-	for (int i = 0; i < MAX_SLOTS; ++i)
+	std::vector<std::string> vecResult;
+	std::string sItem;
+	for (size_t i = 0; i <= sText.size(); i++)
 	{
-		if (i == skip)              continue;
-		if (!realDude(i))           continue;
-		if (slotTeam[i] == T_T)     ++t;
-		else if (slotTeam[i] == T_CT) ++ct;
+		if (i == sText.size() || sText[i] == ',')
+		{
+			size_t iStart = sItem.find_first_not_of(" \t");
+			size_t iEnd = sItem.find_last_not_of(" \t");
+			if (iStart != std::string::npos)
+				vecResult.push_back(sItem.substr(iStart, iEnd - iStart + 1));
+			sItem.clear();
+		}
+		else
+			sItem += sText[i];
+	}
+	return vecResult;
+}
+
+void GetTeamsCount(int& iT, int& iCT, int iSkip = -1)
+{
+	iT = 0;
+	iCT = 0;
+	for (int i = 0; i < 64; i++)
+	{
+		if (i == iSkip || !IsValidPlayer(i))
+			continue;
+		if (g_iTeam[i] == 2)
+			iT++;
+		else if (g_iTeam[i] == 3)
+			iCT++;
 	}
 }
 
-static bool isAdmin(int s)
+bool IsAdmin(int iSlot)
 {
-	if (!cfg.admShield || !g_pAdminCore) return false;
-	return g_pAdminCore->HasPermission(s, cfg.admPerm.c_str());
+	if (!g_bAdminImmunity || !g_pAdminCore)
+		return false;
+	return g_pAdminCore->HasPermission(iSlot, g_sAdminFlag.c_str());
 }
 
-static bool isVip(int s)
+bool IsVip(int iSlot)
 {
-	if (!cfg.vipShield || !g_pVIPCore) return false;
-	if (!g_pVIPCore->VIP_IsClientVIP(s)) return false;
-	if (cfg.vipBands.empty()) return true;
+	if (!g_bVipImmunity || !g_pVIPCore || !g_pVIPCore->VIP_IsClientVIP(iSlot))
+		return false;
+	if (g_vecVipGroups.empty())
+		return true;
 
-	const char* g = g_pVIPCore->VIP_GetClientVIPGroup(s);
-	if (!g || !g[0]) return false;
-	for (const auto& v : cfg.vipBands)
-		if (v == g) return true;
+	const char* szGroup = g_pVIPCore->VIP_GetClientVIPGroup(iSlot);
+	if (!szGroup || !szGroup[0])
+		return false;
+
+	for (auto& sGroup : g_vecVipGroups)
+	{
+		if (sGroup == szGroup)
+			return true;
+	}
 	return false;
 }
 
-static int dieLimit(int s)
+int GetMaxDiff(int iSlot)
 {
-	if (isAdmin(s)) return cfg.admDieGap;
-	if (isVip(s))   return cfg.vipDieGap;
-	return cfg.dieGap;
+	if (IsAdmin(iSlot)) return g_iAdminMaxDiff;
+	if (IsVip(iSlot)) return g_iVipMaxDiff;
+	return g_iMaxDiff;
 }
 
-static int swapLimit(int s)
+int GetBlockDiff(int iSlot)
 {
-	if (isAdmin(s)) return cfg.admSwapGap;
-	if (isVip(s))   return cfg.vipSwapGap;
-	return cfg.swapGap;
+	if (IsAdmin(iSlot)) return g_iAdminBlockDiff;
+	if (IsVip(iSlot)) return g_iVipBlockDiff;
+	return g_iBlockDiff;
 }
 
-static const char* tier(int s)
+const char* GetGroup(int iSlot)
 {
-	if (isAdmin(s)) return "Admin";
-	if (isVip(s))   return "VIP";
+	if (IsAdmin(iSlot)) return "Admin";
+	if (IsVip(iSlot)) return "VIP";
 	return "Player";
 }
 
-static const char* phrase(const char* k)
+const char* GetTranslation(const char* szKey)
 {
-	auto it = loc.find(k);
-	if (it != loc.end()) return it->second.c_str();
+	auto it = g_vecPhrases.find(szKey);
+	if (it != g_vecPhrases.end())
+		return it->second.c_str();
 
-	if (!strcmp(k, "FAB_Chat_T"))
+	if (!strcmp(szKey, "FAB_Chat_T"))
 		return "{BLUE}[FAB] {DEFAULT}You were transferred to the team {RED}Terrorists {DEFAULT}for balance";
-	if (!strcmp(k, "FAB_Chat_CT"))
+	if (!strcmp(szKey, "FAB_Chat_CT"))
 		return "{BLUE}[FAB] {DEFAULT}You were transferred to the team {RED}Counter-Terrorists {DEFAULT}for balance";
-	if (!strcmp(k, "FAB_Block"))
+	if (!strcmp(szKey, "FAB_Block"))
 		return "{BLUE}[FAB] {DEFAULT}You cannot switch to this team, the difference is too big!";
-	return k;
+	return szKey;
 }
 
-static void lazyMove(int s, int dst, bool bHard = false)
+bool MovePlayer(int iSlot, int iTeam, bool bPrestart)
 {
-	if (!g_pUtils || !g_pPlayers) return;
+	if ((iTeam != 2 && iTeam != 3) || !IsValidPlayer(iSlot) || !g_pPlayers->IsInGame(iSlot))
+		return false;
 
-	g_pUtils->CreateTimer(0.1f, [s, dst, bHard]() -> float {
-		if (!g_pPlayers || !g_pPlayers->IsConnected(s))
-			return -1.0f;
-		selfNudge[s] = true;
-		if (bHard)
-			g_pPlayers->ChangeTeam(s, dst);
-		else
-			g_pPlayers->SwitchTeam(s, dst);
-		return -1.0f;
-	});
-}
-
-static void killNative()
-{
-	if (!engine) return;
-	if (!cfg.muteNative)
+	if (!bPrestart && g_bAlive[iSlot])
 	{
-		dbg("[NATIVE] muteNative=0 -- not touching mp_autoteambalance / mp_limitteams");
-		return;
-	}
-	engine->ServerCommand("mp_autoteambalance 0\n");
-	engine->ServerCommand("mp_limitteams 0\n");
-	Msg("%s native balance disabled (mp_autoteambalance 0, mp_limitteams 0)\n", TAG);
-	dbg("[NATIVE] forced mp_autoteambalance 0 + mp_limitteams 0");
-}
-
-static void pullCfg()
-{
-	cfg = Cfg();
-
-	KeyValues* kv = new KeyValues("fab");
-	const char* path = "addons/configs/fastautobalance.ini";
-
-	if (!kv->LoadFromFile(filesystem, path, "GAME"))
-	{
-		Msg("%s no cfg at %s, using defaults\n", TAG, path);
-		delete kv;
-		return;
+		LogDebug("[MOVE] %d (%s) -> %s skipped, player is alive", iSlot, GetClientName(iSlot), GetTeamName(iTeam));
+		return false;
 	}
 
-	cfg.dieGap       = kv->GetInt("MaxAD",            cfg.dieGap);
-	cfg.swapGap      = kv->GetInt("block",            cfg.swapGap);
-	cfg.yapAtPlayer  = kv->GetBool("msg",             cfg.yapAtPlayer);
-	cfg.noisy        = kv->GetBool("debug",           cfg.noisy);
-	cfg.muteNative   = kv->GetBool("force_native_off", cfg.muteNative);
-
-	cfg.admShield    = kv->GetBool("admin_imune",     cfg.admShield);
-	cfg.admPerm      = kv->GetString("admin_flags",   cfg.admPerm.c_str());
-	cfg.admDieGap    = kv->GetInt("admin_max",        cfg.admDieGap);
-	cfg.admSwapGap   = kv->GetInt("admin_block",      cfg.admSwapGap);
-
-	cfg.vipShield    = kv->GetBool("vip_imune",       cfg.vipShield);
-	cfg.vipDieGap    = kv->GetInt("vip_max",          cfg.vipDieGap);
-	cfg.vipSwapGap   = kv->GetInt("vip_block",        cfg.vipSwapGap);
-
-	cfg.vipBands.clear();
-	const char* vg = kv->GetString("vip_groups", "");
-	if (vg && *vg) cfg.vipBands = chopCsv(vg);
-
-	delete kv;
-
-	Msg("%s cfg: die=%d swap=%d msg=%d dbg=%d native_off=%d | adm: shield=%d die=%d swap=%d perm=%s | vip: shield=%d die=%d swap=%d\n",
-		TAG,
-		cfg.dieGap, cfg.swapGap, (int)cfg.yapAtPlayer, (int)cfg.noisy, (int)cfg.muteNative,
-		(int)cfg.admShield, cfg.admDieGap, cfg.admSwapGap, cfg.admPerm.c_str(),
-		(int)cfg.vipShield, cfg.vipDieGap, cfg.vipSwapGap);
-
-	if (cfg.noisy)
-	{
-		std::string vs = "all";
-		if (!cfg.vipBands.empty())
-		{
-			vs.clear();
-			for (size_t i = 0; i < cfg.vipBands.size(); ++i)
-			{
-				if (i) vs += ",";
-				vs += cfg.vipBands[i];
-			}
-		}
-		dbg("[CFG] die=%d swap=%d msg=%d native_off=%d | adm: shield=%d die=%d swap=%d perm=%s | vip: shield=%d die=%d swap=%d bands=%s",
-			cfg.dieGap, cfg.swapGap, (int)cfg.yapAtPlayer, (int)cfg.muteNative,
-			(int)cfg.admShield, cfg.admDieGap, cfg.admSwapGap, cfg.admPerm.c_str(),
-			(int)cfg.vipShield, cfg.vipDieGap, cfg.vipSwapGap,
-			vs.c_str());
-	}
-}
-
-static void pullPhrases()
-{
-	loc.clear();
-
-	KeyValues* kv = new KeyValues("Phrases");
-	const char* path = "addons/translations/fab_phrases.txt";
-
-	if (!kv->LoadFromFile(filesystem, path, "GAME"))
-	{
-		Msg("%s no phrases at %s, using defaults\n", TAG, path);
-		delete kv;
-		return;
-	}
-
-	const char* lang = g_pUtils ? g_pUtils->GetLanguage() : "en";
-
-	FOR_EACH_SUBKEY(kv, p)
-	{
-		const char* k = p->GetName();
-		const char* v = p->GetString(lang, "");
-		if (k && v && v[0]) loc[k] = v;
-	}
-
-	delete kv;
-	Msg("%s phrases for: %s\n", TAG, lang ? lang : "en");
-}
-
-static bool tagDeath(int s, int t, int ct, int side)
-{
-	const int lim = dieLimit(s);
-
-	if (side == T_T && t > ct && (t - ct) > lim)
-	{
-		if (t <= 0)
-		{
-			dbg("[DEATH] slot %d (%s) died T | T=%d CT=%d | safety: empty T | NOT marked",
-				s, nameOf(s), t, ct);
-			return false;
-		}
-		queue[s] = { T_CT, T_T, rno };
-		dbg("[DEATH] slot %d (%s) %s died T | T=%d CT=%d gap=%d > lim=%d | MARKED for CT (round %d)",
-			s, nameOf(s), tier(s), t, ct, (t - ct), lim, rno);
-		Msg("%s marked %d: T->CT (round %d)\n", TAG, s, rno);
-		return true;
-	}
-
-	if (side == T_CT && ct > t && (ct - t) > lim)
-	{
-		if (ct <= 0)
-		{
-			dbg("[DEATH] slot %d (%s) died CT | T=%d CT=%d | safety: empty CT | NOT marked",
-				s, nameOf(s), t, ct);
-			return false;
-		}
-		queue[s] = { T_T, T_CT, rno };
-		dbg("[DEATH] slot %d (%s) %s died CT | T=%d CT=%d gap=%d > lim=%d | MARKED for T (round %d)",
-			s, nameOf(s), tier(s), t, ct, (ct - t), lim, rno);
-		Msg("%s marked %d: CT->T (round %d)\n", TAG, s, rno);
-		return true;
-	}
-
-	dbg("[DEATH] slot %d (%s) died %s | T=%d CT=%d gap=%d <= lim=%d | NOT marked",
-		s, nameOf(s), sideName(side), t, ct, abs(t - ct), lim);
-	return false;
-}
-
-static void gateSwap(IGameEvent* e)
-{
-	if (!e || !g_pPlayers || !g_pUtils) return;
-
-	const int  s  = e->GetInt("userid");
-	const int  nt = e->GetInt("team");
-	const int  ot = e->GetInt("oldteam");
-	const bool dc = e->GetBool("disconnect");
-
-	if (!slotOk(s))                  return;
-	if (g_pPlayers->IsFakeClient(s)) return;
-	if (dc)                          return;
-	if (nt <= T_SPEC)                return;
-	if (ot <= T_SPEC)                return;
-	if (nt == ot)                    return;
-
-	if (selfNudge[s])
-	{
-		selfNudge[s] = false;
-		return;
-	}
-
-	int t, ct;
-	headCount(t, ct, s);
-	if (nt == T_T)       ++t;
-	else if (nt == T_CT) ++ct;
-
-	const int gap = abs(t - ct);
-	const int lim = swapLimit(s);
-
-	if (gap > lim)
-	{
-		vetoMark[s] = true;
-		lazyMove(s, ot, true);
-
-		dbg("[VETO] slot %d (%s) %s tried %s->%s | would be T=%d CT=%d gap=%d > lim=%d | BLOCKED",
-			s, nameOf(s), tier(s), sideName(ot), sideName(nt), t, ct, gap, lim);
-
-		if (cfg.yapAtPlayer)
-			g_pUtils->PrintToChat(s, " %s", phrase("FAB_Block"));
-	}
-	else
-	{
-		dbg("[OK]   slot %d (%s) %s switch %s->%s | will be T=%d CT=%d gap=%d <= lim=%d | ALLOW",
-			s, nameOf(s), tier(s), sideName(ot), sideName(nt), t, ct, gap, lim);
-	}
-}
-
-static void noteSwap(IGameEvent* e)
-{
-	if (!e) return;
-	const int s  = e->GetInt("userid");
-	const int nt = e->GetInt("team");
-	const int ot = e->GetInt("oldteam");
-	if (!slotOk(s)) return;
-
-	if (vetoMark[s])
-	{
-		vetoMark[s] = false;
-		dbg("[TEAM] slot %d (%s) %d->%d | (vetoed, skip)",
-			s, nameOf(s), ot, nt);
-		return;
-	}
-
-	const int prev = slotTeam[s];
-	slotTeam[s] = nt;
-
-	auto it = queue.find(s);
-	if (it != queue.end())
-	{
-		const bool gone =
-			(nt <= T_SPEC) ||
-			(nt != it->second.src);
-		if (gone)
-		{
-			dbg("[TEAM] slot %d (%s) %s->%s | was queued->%s | DROPPED",
-				s, nameOf(s), sideName(ot), sideName(nt),
-				sideName(it->second.dst));
-			queue.erase(it);
-		}
-	}
-
-	if (cfg.noisy)
-	{
-		int t, ct;
-		headCount(t, ct);
-		dbg("[TEAM] slot %d (%s) %s->%s | now T=%d CT=%d (cached %d)",
-			s, nameOf(s), sideName(ot), sideName(nt), t, ct, prev);
-	}
-}
-
-static void onTeamEvent(const char*, IGameEvent* e, bool)
-{
-	gateSwap(e);
-	noteSwap(e);
-}
-
-static void onDeath(const char*, IGameEvent* e, bool)
-{
-	if (!e) return;
-
-	const int s = e->GetInt("userid");
-	if (!slotOk(s))    return;
-	if (!realDude(s))  return;
-
-	const int side = slotTeam[s];
-	if (side != T_T && side != T_CT) return;
-
-	int t, ct;
-	headCount(t, ct);
-	if (side == T_T)       --t;
-	else                   --ct;
-
-	tagDeath(s, t, ct, side);
-}
-
-static void wipeStaleMark(const char*, IGameEvent* e, bool)
-{
-	if (!e) return;
-	const int s = e->GetInt("userid");
-	if (!slotOk(s)) return;
-
-	auto it = queue.find(s);
-	if (it == queue.end()) return;
-
-	if (it->second.rno == rno)
-	{
-		dbg("[SPAWN] slot %d (%s) | respawned same round | queued->%s DROPPED",
-			s, nameOf(s), sideName(it->second.dst));
-		queue.erase(it);
-	}
-}
-
-static void flushQueue(const char*, IGameEvent*, bool)
-{
-	++rno;
-
-	int t, ct;
-	headCount(t, ct);
-	const int q = (int)queue.size();
-
-	dbg("[ROUND] %d started | T=%d CT=%d gap=%d | q=%d", rno, t, ct, abs(t - ct), q);
-	Msg("%s round %d started\n", TAG, rno);
-
-	if (q == 0) return;
-
-	std::vector<int> ids;
-	ids.reserve(queue.size());
-	for (const auto& kv : queue) ids.push_back(kv.first);
-
-	for (int s : ids)
-	{
-		auto it = queue.find(s);
-		if (it == queue.end()) continue;
-
-		const Marked m = it->second;
-
-		if (!realDude(s))
-		{
-			dbg("[ROUND] slot %d (%s) | not active | DROPPED", s, nameOf(s));
-			queue.erase(s);
-			continue;
-		}
-
-		const int cur = slotTeam[s];
-		if (cur != m.src)
-		{
-			dbg("[ROUND] slot %d (%s) | side moved (now %s, died %s) | DROPPED",
-				s, nameOf(s), sideName(cur), sideName(m.src));
-			queue.erase(s);
-			continue;
-		}
-
-		int tn, ctn;
-		headCount(tn, ctn);
-
-		const int lim = dieLimit(s);
-		const char* tt = tier(s);
-
-		const bool dropToCT = (m.dst == T_CT && tn > ctn && (tn - ctn) > lim);
-		const bool dropToT  = (m.dst == T_T  && ctn > tn && (ctn - tn) > lim);
-
-		if (!dropToCT && !dropToT)
-		{
-			dbg("[ROUND] slot %d (%s) %s | T=%d CT=%d gap=%d <= lim=%d | not needed | DROPPED",
-				s, nameOf(s), tt, tn, ctn, abs(tn - ctn), lim);
-			queue.erase(s);
-			continue;
-		}
-
-		const int ta = (m.dst == T_T)  ? tn + 1  : tn - 1;
-		const int ca = (m.dst == T_CT) ? ctn + 1 : ctn - 1;
-
-		if (ta <= 0 || ca <= 0)
-		{
-			dbg("[ROUND] slot %d (%s) %s | safety: empty side after (T=%d CT=%d) | DROPPED",
-				s, nameOf(s), tt, ta, ca);
-			queue.erase(s);
-			continue;
-		}
-
-		const int gn = abs(tn - ctn);
-		const int ga = abs(ta - ca);
-		if (ga >= gn)
-		{
-			dbg("[ROUND] slot %d (%s) %s | safety: gap stays (now=%d after=%d) | DROPPED",
-				s, nameOf(s), tt, gn, ga);
-			queue.erase(s);
-			continue;
-		}
-
-		lazyMove(s, m.dst);
-		slotTeam[s] = m.dst;
-
-		dbg("[ROUND] slot %d (%s) %s | T=%d CT=%d gap=%d > lim=%d | FLIPPED %s->%s",
-			s, nameOf(s), tt, tn, ctn, gn, lim, sideName(m.src), sideName(m.dst));
-		Msg("%s flipped %d -> team %d (T=%d CT=%d)\n", TAG, s, m.dst, tn, ctn);
-
-		if (cfg.yapAtPlayer && g_pUtils)
-		{
-			const char* msg = (m.dst == T_CT)
-				? phrase("FAB_Chat_CT")
-				: phrase("FAB_Chat_T");
-			g_pUtils->PrintToChat(s, " %s", msg);
-		}
-
-		queue.erase(s);
-	}
-}
-
-static bool didPrestart = false;
-
-static void onRoundPrestart(const char*, IGameEvent*, bool)
-{
-	didPrestart = true;
-	flushQueue(nullptr, nullptr, false);
-}
-
-static void onRoundStart(const char*, IGameEvent*, bool)
-{
-	if (didPrestart) { didPrestart = false; return; }
-	flushQueue(nullptr, nullptr, false);
-}
-
-static void wireSlot(const char*, IGameEvent* e, bool)
-{
-	if (!e) return;
-	const int s = e->GetInt("userid");
-	if (!slotOk(s)) return;
-
-	slotTeam[s]  = 0;
-	selfNudge[s] = false;
-	vetoMark[s]  = false;
-}
-
-static void unwireSlot(const char*, IGameEvent* e, bool)
-{
-	if (!e) return;
-	const int s = e->GetInt("userid");
-	if (!slotOk(s)) return;
-
-	auto it = queue.find(s);
-	if (it != queue.end())
-	{
-		dbg("[DC] slot %d (%s) | was queued->%s | DROPPED",
-			s, nameOf(s), sideName(it->second.dst));
-		queue.erase(it);
-		Msg("%s dropped %d: dc\n", TAG, s);
-	}
-
-	slotTeam[s]  = 0;
-	selfNudge[s] = false;
-	vetoMark[s]  = false;
-}
-
-static bool reloadCmd(int s, const char*)
-{
-	pullCfg();
-	pullPhrases();
-	killNative();
-
-	dbg("[RELOAD] reloaded by slot %d (%s)", s, nameOf(s));
-
-	if (g_pUtils)
-		g_pUtils->PrintToChat(s, " \x0B%s \x04reloaded", TAG);
+	g_bPluginMove[iSlot] = true;
+	g_iTeam[iSlot] = iTeam;
+	g_pPlayers->SwitchTeam(iSlot, iTeam);
+	g_bPluginMove[iSlot] = false;
+
+	LogDebug("[MOVE] %d (%s) -> %s | alive %d | prestart %d", iSlot, GetClientName(iSlot), GetTeamName(iTeam), g_bAlive[iSlot], bPrestart);
 	return true;
 }
 
-static void bootHooks()
+void DisableNativeBalance()
 {
-	g_pGameEntitySystem = g_pUtils ? g_pUtils->GetCGameEntitySystem() : nullptr;
-	g_pEntitySystem     = g_pUtils ? g_pUtils->GetCEntitySystem()     : nullptr;
-	gpGlobals           = g_pUtils ? g_pUtils->GetCGlobalVars()       : nullptr;
+	if (!engine)
+		return;
 
-	pullCfg();
-	pullPhrases();
-	killNative();
-
-	rno = 0;
-	didPrestart = false;
-	queue.clear();
-	for (int i = 0; i < MAX_SLOTS; ++i)
+	if (!g_bForceNativeOff)
 	{
-		slotTeam[i]  = 0;
-		selfNudge[i] = false;
-		vetoMark[i]  = false;
+		LogDebug("[NATIVE] force_native_off 0, skip");
+		return;
 	}
 
-	if (cfg.noisy)
+	engine->ServerCommand("mp_autoteambalance 0\n");
+	engine->ServerCommand("mp_limitteams 0\n");
+	Msg("[FAB] mp_autoteambalance 0, mp_limitteams 0\n");
+	LogDebug("[NATIVE] mp_autoteambalance 0, mp_limitteams 0");
+}
+
+void LoadConfig()
+{
+	g_iMaxDiff = 2;
+	g_iBlockDiff = 1;
+	g_bMessage = true;
+	g_bDebug = false;
+	g_bForceNativeOff = true;
+	g_bAdminImmunity = true;
+	g_sAdminFlag = "@admin/balance";
+	g_iAdminMaxDiff = 3;
+	g_iAdminBlockDiff = 2;
+	g_bVipImmunity = true;
+	g_vecVipGroups.clear();
+	g_iVipMaxDiff = 3;
+	g_iVipBlockDiff = 2;
+
+	KeyValues* kv = new KeyValues("fab");
+	if (!kv->LoadFromFile(filesystem, "addons/configs/fastautobalance.ini", "GAME"))
 	{
-		dbg("========================================");
-		dbg("[BOOT] FastAutoBalance v%s up", VER);
-		dbg("========================================");
+		Msg("[FAB] Failed to load addons/configs/fastautobalance.ini, using defaults\n");
+		delete kv;
+		return;
 	}
+
+	g_iMaxDiff = kv->GetInt("MaxAD", 2);
+	g_iBlockDiff = kv->GetInt("block", 1);
+	g_bMessage = kv->GetBool("msg", true);
+	g_bDebug = kv->GetBool("debug", false);
+	g_bForceNativeOff = kv->GetBool("force_native_off", true);
+
+	g_bAdminImmunity = kv->GetBool("admin_imune", true);
+	g_sAdminFlag = kv->GetString("admin_flags", "@admin/balance");
+	g_iAdminMaxDiff = kv->GetInt("admin_max", 3);
+	g_iAdminBlockDiff = kv->GetInt("admin_block", 2);
+
+	g_bVipImmunity = kv->GetBool("vip_imune", true);
+	g_iVipMaxDiff = kv->GetInt("vip_max", 3);
+	g_iVipBlockDiff = kv->GetInt("vip_block", 2);
+	g_vecVipGroups = SplitString(kv->GetString("vip_groups", ""));
+
+	delete kv;
+
+	Msg("[FAB] Config loaded: max %d block %d | admin %d %d/%d | vip %d %d/%d | debug %d\n",
+		g_iMaxDiff, g_iBlockDiff, g_bAdminImmunity, g_iAdminMaxDiff, g_iAdminBlockDiff,
+		g_bVipImmunity, g_iVipMaxDiff, g_iVipBlockDiff, g_bDebug);
+
+	if (g_bDebug)
+	{
+		Msg("[FAB] Debug log: %s/addons/logs/fab/\n", g_SMAPI->GetBaseDir());
+
+		std::string sGroups;
+		for (auto& sGroup : g_vecVipGroups)
+			sGroups += (sGroups.empty() ? "" : ",") + sGroup;
+
+		LogDebug("[CONFIG] max %d block %d msg %d native_off %d | admin %d %d/%d %s | vip %d %d/%d %s",
+			g_iMaxDiff, g_iBlockDiff, g_bMessage, g_bForceNativeOff,
+			g_bAdminImmunity, g_iAdminMaxDiff, g_iAdminBlockDiff, g_sAdminFlag.c_str(),
+			g_bVipImmunity, g_iVipMaxDiff, g_iVipBlockDiff, sGroups.empty() ? "all" : sGroups.c_str());
+	}
+}
+
+void LoadTranslations()
+{
+	g_vecPhrases.clear();
+
+	KeyValues* kv = new KeyValues("Phrases");
+	if (!kv->LoadFromFile(filesystem, "addons/translations/fab_phrases.txt", "GAME"))
+	{
+		Msg("[FAB] Failed to load addons/translations/fab_phrases.txt\n");
+		delete kv;
+		return;
+	}
+
+	const char* szLanguage = g_pUtils ? g_pUtils->GetLanguage() : "en";
+	FOR_EACH_SUBKEY(kv, pKey)
+	{
+		const char* szText = pKey->GetString(szLanguage, "");
+		if (szText[0])
+			g_vecPhrases[pKey->GetName()] = szText;
+	}
+
+	delete kv;
+}
+
+void CheckDeath(int iSlot, int iT, int iCT, int iTeam)
+{
+	int iMax = GetMaxDiff(iSlot);
+
+	if (iTeam == 2 && iT > iCT && iT - iCT > iMax)
+	{
+		g_Queue[iSlot] = { 3, 2, g_iRound };
+		LogDebug("[DEATH] %d (%s) %s died T | T %d CT %d | diff %d > %d | will move to CT (round %d)",
+			iSlot, GetClientName(iSlot), GetGroup(iSlot), iT, iCT, iT - iCT, iMax, g_iRound);
+		return;
+	}
+
+	if (iTeam == 3 && iCT > iT && iCT - iT > iMax)
+	{
+		g_Queue[iSlot] = { 2, 3, g_iRound };
+		LogDebug("[DEATH] %d (%s) %s died CT | T %d CT %d | diff %d > %d | will move to T (round %d)",
+			iSlot, GetClientName(iSlot), GetGroup(iSlot), iT, iCT, iCT - iT, iMax, g_iRound);
+		return;
+	}
+
+	LogDebug("[DEATH] %d (%s) died %s | T %d CT %d | diff %d <= %d",
+		iSlot, GetClientName(iSlot), GetTeamName(iTeam), iT, iCT, abs(iT - iCT), iMax);
+}
+
+void FastAutoBalance::Hook_ClientCommand(CPlayerSlot slot, const CCommand& args)
+{
+	int iSlot = slot.Get();
+	if (!IsValidPlayer(iSlot) || args.ArgC() < 2 || strcmp(args.Arg(0), "jointeam"))
+		RETURN_META(MRES_IGNORED);
+
+	int iNewTeam = atoi(args.Arg(1));
+	int iTeam = g_iTeam[iSlot];
+	if ((iNewTeam != 2 && iNewTeam != 3) || iNewTeam == iTeam || (iTeam != 2 && iTeam != 3))
+		RETURN_META(MRES_IGNORED);
+
+	int iT, iCT;
+	GetTeamsCount(iT, iCT, iSlot);
+	if (iNewTeam == 2)
+		iT++;
+	else
+		iCT++;
+
+	int iDiff = abs(iT - iCT);
+	int iBlock = GetBlockDiff(iSlot);
+
+	if (iDiff <= iBlock)
+	{
+		LogDebug("[JOIN] %d (%s) %s | %s -> %s | T %d CT %d | diff %d <= %d | allowed",
+			iSlot, GetClientName(iSlot), GetGroup(iSlot), GetTeamName(iTeam), GetTeamName(iNewTeam), iT, iCT, iDiff, iBlock);
+		RETURN_META(MRES_IGNORED);
+	}
+
+	time_t iTime = time(nullptr);
+	if (iTime - g_iBlockMsgTime[iSlot] >= 2)
+	{
+		LogDebug("[JOIN] %d (%s) %s | %s -> %s | T %d CT %d | diff %d > %d | blocked (+%d)",
+			iSlot, GetClientName(iSlot), GetGroup(iSlot), GetTeamName(iTeam), GetTeamName(iNewTeam), iT, iCT, iDiff, iBlock, g_iBlockMsgSkip[iSlot]);
+
+		if (g_bMessage && g_pUtils)
+			g_pUtils->PrintToChat(iSlot, " %s", GetTranslation("FAB_Block"));
+
+		g_iBlockMsgTime[iSlot] = iTime;
+		g_iBlockMsgSkip[iSlot] = 0;
+	}
+	else
+		g_iBlockMsgSkip[iSlot]++;
+
+	RETURN_META(MRES_SUPERCEDE);
+}
+
+void OnPlayerTeam(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+{
+	int iSlot = pEvent->GetInt("userid");
+	if (iSlot < 0 || iSlot >= 64)
+		return;
+
+	int iTeam = pEvent->GetInt("team");
+	int iOldTeam = pEvent->GetInt("oldteam");
+
+	if (iTeam <= 1)
+		g_bAlive[iSlot] = false;
+
+	int iCached = g_iTeam[iSlot];
+	g_iTeam[iSlot] = iTeam;
+
+	auto it = g_Queue.find(iSlot);
+	if (it != g_Queue.end() && iTeam != it->second.iOldTeam)
+	{
+		LogDebug("[TEAM] %d (%s) %s -> %s | removed from queue", iSlot, GetClientName(iSlot), GetTeamName(iOldTeam), GetTeamName(iTeam));
+		g_Queue.erase(it);
+	}
+
+	if (g_bDebug)
+	{
+		int iT, iCT;
+		GetTeamsCount(iT, iCT);
+		LogDebug("[TEAM] %d (%s) %s -> %s by %s | T %d CT %d (was %d)",
+			iSlot, GetClientName(iSlot), GetTeamName(iOldTeam), GetTeamName(iTeam), g_bPluginMove[iSlot] ? "FAB" : "game", iT, iCT, iCached);
+	}
+}
+
+void OnPlayerDeath(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+{
+	int iSlot = pEvent->GetInt("userid");
+	if (iSlot < 0 || iSlot >= 64)
+		return;
+
+	g_bAlive[iSlot] = false;
+
+	int iTeam = g_iTeam[iSlot];
+	if (!IsValidPlayer(iSlot) || (iTeam != 2 && iTeam != 3))
+		return;
+
+	int iT, iCT;
+	GetTeamsCount(iT, iCT);
+	if (iTeam == 2)
+		iT--;
+	else
+		iCT--;
+
+	CheckDeath(iSlot, iT, iCT, iTeam);
+}
+
+void OnPlayerSpawn(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+{
+	int iSlot = pEvent->GetInt("userid");
+	if (iSlot < 0 || iSlot >= 64)
+		return;
+
+	g_bAlive[iSlot] = true;
+
+	auto it = g_Queue.find(iSlot);
+	if (it != g_Queue.end() && it->second.iRound == g_iRound)
+	{
+		LogDebug("[SPAWN] %d (%s) respawned this round, removed from queue", iSlot, GetClientName(iSlot));
+		g_Queue.erase(it);
+	}
+}
+
+void BalanceTeams(bool bPrestart)
+{
+	g_iRound++;
+
+	int iT, iCT;
+	GetTeamsCount(iT, iCT);
+	LogDebug("[ROUND] %d (%s) | T %d CT %d | queue %d", g_iRound, bPrestart ? "round_prestart" : "round_start", iT, iCT, (int)g_Queue.size());
+
+	if (g_Queue.empty())
+		return;
+
+	std::vector<int> vecSlots;
+	for (auto& it : g_Queue)
+		vecSlots.push_back(it.first);
+
+	for (int iSlot : vecSlots)
+	{
+		auto it = g_Queue.find(iSlot);
+		if (it == g_Queue.end())
+			continue;
+
+		BalanceInfo info = it->second;
+		g_Queue.erase(it);
+
+		if (!IsValidPlayer(iSlot))
+		{
+			LogDebug("[ROUND] %d left the server, skip", iSlot);
+			continue;
+		}
+
+		if (g_iTeam[iSlot] != info.iOldTeam)
+		{
+			LogDebug("[ROUND] %d (%s) is %s now (died as %s), skip", iSlot, GetClientName(iSlot), GetTeamName(g_iTeam[iSlot]), GetTeamName(info.iOldTeam));
+			continue;
+		}
+
+		GetTeamsCount(iT, iCT);
+		int iMax = GetMaxDiff(iSlot);
+
+		bool bNeed = (info.iNewTeam == 3 && iT > iCT && iT - iCT > iMax) || (info.iNewTeam == 2 && iCT > iT && iCT - iT > iMax);
+		if (!bNeed)
+		{
+			LogDebug("[ROUND] %d (%s) %s | T %d CT %d | diff %d <= %d | not needed", iSlot, GetClientName(iSlot), GetGroup(iSlot), iT, iCT, abs(iT - iCT), iMax);
+			continue;
+		}
+
+		int iNewT = info.iNewTeam == 2 ? iT + 1 : iT - 1;
+		int iNewCT = info.iNewTeam == 3 ? iCT + 1 : iCT - 1;
+
+		if (iNewT <= 0 || iNewCT <= 0)
+		{
+			LogDebug("[ROUND] %d (%s) | team would be empty (T %d CT %d), skip", iSlot, GetClientName(iSlot), iNewT, iNewCT);
+			continue;
+		}
+
+		if (abs(iNewT - iNewCT) >= abs(iT - iCT))
+		{
+			LogDebug("[ROUND] %d (%s) | diff does not change (%d -> %d), skip", iSlot, GetClientName(iSlot), abs(iT - iCT), abs(iNewT - iNewCT));
+			continue;
+		}
+
+		if (!MovePlayer(iSlot, info.iNewTeam, bPrestart))
+		{
+			LogDebug("[ROUND] %d (%s) move failed", iSlot, GetClientName(iSlot));
+			continue;
+		}
+
+		LogDebug("[ROUND] %d (%s) %s | T %d CT %d | moved %s -> %s",
+			iSlot, GetClientName(iSlot), GetGroup(iSlot), iT, iCT, GetTeamName(info.iOldTeam), GetTeamName(info.iNewTeam));
+		Msg("[FAB] %s moved to %s (T %d CT %d)\n", GetClientName(iSlot), GetTeamName(info.iNewTeam), iT, iCT);
+
+		if (g_bMessage && g_pUtils)
+			g_pUtils->PrintToChat(iSlot, " %s", GetTranslation(info.iNewTeam == 3 ? "FAB_Chat_CT" : "FAB_Chat_T"));
+	}
+}
+
+void OnRoundPrestart(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+{
+	g_bPrestart = true;
+	BalanceTeams(true);
+}
+
+void OnRoundStart(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+{
+	if (g_bPrestart)
+	{
+		g_bPrestart = false;
+		return;
+	}
+	BalanceTeams(false);
+}
+
+void OnPlayerConnectFull(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+{
+	int iSlot = pEvent->GetInt("userid");
+	if (iSlot < 0 || iSlot >= 64)
+		return;
+
+	ResetPlayer(iSlot);
+}
+
+void OnPlayerDisconnect(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
+{
+	int iSlot = pEvent->GetInt("userid");
+	if (iSlot < 0 || iSlot >= 64)
+		return;
+
+	if (g_Queue.erase(iSlot))
+		LogDebug("[DISCONNECT] %d (%s) removed from queue", iSlot, GetClientName(iSlot));
+
+	ResetPlayer(iSlot);
+}
+
+float CheckPlayers()
+{
+	for (int i = 0; i < 64; i++)
+	{
+		if (!IsValidPlayer(i))
+		{
+			g_iTeam[i] = 0;
+			g_bAlive[i] = false;
+		}
+	}
+	return 1.0f;
+}
+
+bool OnReloadCommand(int iSlot, const char* szContent)
+{
+	if (iSlot >= 0 && (!g_pAdminCore || !g_pAdminCore->HasPermission(iSlot, g_sAdminFlag.c_str())))
+		return true;
+
+	LoadConfig();
+	LoadTranslations();
+	DisableNativeBalance();
+
+	LogDebug("[RELOAD] by %d (%s)", iSlot, iSlot >= 0 ? GetClientName(iSlot) : "Console");
+
+	if (iSlot >= 0)
+		g_pUtils->PrintToChat(iSlot, " \x0B[FAB] \x04Config reloaded");
+	else
+		Msg("[FAB] Config reloaded\n");
+	return true;
+}
+
+void OnStartupServer()
+{
+	g_pGameEntitySystem = g_pUtils->GetCGameEntitySystem();
+	g_pEntitySystem = g_pUtils->GetCEntitySystem();
+	gpGlobals = g_pUtils->GetCGlobalVars();
+
+	LoadConfig();
+	LoadTranslations();
+	DisableNativeBalance();
+
+	g_iRound = 0;
+	g_bPrestart = false;
+	g_Queue.clear();
+	for (int i = 0; i < 64; i++)
+		ResetPlayer(i);
+
+	LogDebug("[START] FastAutoBalance %s", g_FastAutoBalance.GetVersion());
 }
 
 bool FastAutoBalance::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late)
 {
 	PLUGIN_SAVEVARS();
+	g_bLateLoad = late;
 
-	GET_V_IFACE_CURRENT(GetEngineFactory,     engine,     IVEngineServer2, SOURCE2ENGINETOSERVER_INTERFACE_VERSION);
-	GET_V_IFACE_CURRENT(GetFileSystemFactory, filesystem, IFileSystem,     FILESYSTEM_INTERFACE_VERSION);
+	GET_V_IFACE_CURRENT(GetEngineFactory, engine, IVEngineServer2, SOURCE2ENGINETOSERVER_INTERFACE_VERSION);
+	GET_V_IFACE_CURRENT(GetFileSystemFactory, filesystem, IFileSystem, FILESYSTEM_INTERFACE_VERSION);
+	GET_V_IFACE_CURRENT(GetServerFactory, g_pGameClients, ISource2GameClients, INTERFACEVERSION_SERVERGAMECLIENTS);
+
+	SH_ADD_HOOK(ISource2GameClients, ClientCommand, g_pGameClients, SH_MEMBER(this, &FastAutoBalance::Hook_ClientCommand), false);
 
 	g_SMAPI->AddListener(this, this);
-
-	Msg("%s v%s loading...\n", TAG, VER);
 	return true;
 }
 
-bool FastAutoBalance::Unload(char*, size_t)
+bool FastAutoBalance::Unload(char* error, size_t maxlen)
 {
-	if (g_pUtils) g_pUtils->ClearAllHooks(g_PLID);
+	SH_REMOVE_HOOK(ISource2GameClients, ClientCommand, g_pGameClients, SH_MEMBER(this, &FastAutoBalance::Hook_ClientCommand), false);
 
-	loc.clear();
-	cfg.vipBands.clear();
-	queue.clear();
+	if (g_pUtils)
+	{
+		if (g_pCheckTimer)
+		{
+			g_pUtils->RemoveTimer(g_pCheckTimer);
+			g_pCheckTimer = nullptr;
+		}
+		g_pUtils->ClearAllHooks(g_PLID);
+	}
 
-	Msg("%s bye\n", TAG);
+	g_vecPhrases.clear();
+	g_vecVipGroups.clear();
+	g_Queue.clear();
 	return true;
 }
 
 void FastAutoBalance::AllPluginsLoaded()
 {
-	Msg("%s AllPluginsLoaded() v%s\n", TAG, VER);
-
 	int ret;
-
 	g_pUtils = (IUtilsApi*)g_SMAPI->MetaFactory(Utils_INTERFACE, &ret, NULL);
-	if (ret == META_IFACE_FAILED || !g_pUtils)
+	if (ret == META_IFACE_FAILED)
 	{
-		Msg("%s ERR: Utils API missing\n", TAG);
+		Msg("[FAB] Missing Utils plugin\n");
 		return;
 	}
 
 	g_pPlayers = (IPlayersApi*)g_SMAPI->MetaFactory(PLAYERS_INTERFACE, &ret, NULL);
-	if (ret == META_IFACE_FAILED || !g_pPlayers)
+	if (ret == META_IFACE_FAILED)
 	{
-		Msg("%s ERR: Players API missing\n", TAG);
+		Msg("[FAB] Missing Players plugin\n");
 		return;
 	}
 
 	g_pVIPCore = (IVIPApi*)g_SMAPI->MetaFactory(VIP_INTERFACE, &ret, NULL);
-	if (ret == META_IFACE_FAILED) { g_pVIPCore = nullptr; Msg("%s VIP API skipped\n", TAG); }
+	if (ret == META_IFACE_FAILED)
+		g_pVIPCore = nullptr;
 
 	g_pAdminCore = (IAdminApi*)g_SMAPI->MetaFactory(Admin_INTERFACE, &ret, NULL);
-	if (ret == META_IFACE_FAILED) { g_pAdminCore = nullptr; Msg("%s Admin API skipped\n", TAG); }
+	if (ret == META_IFACE_FAILED)
+		g_pAdminCore = nullptr;
 
-	for (int i = 0; i < MAX_SLOTS; ++i)
-	{
-		slotTeam[i]  = 0;
-		selfNudge[i] = false;
-		vetoMark[i]  = false;
-	}
+	for (int i = 0; i < 64; i++)
+		ResetPlayer(i);
 
-	g_pUtils->StartupServer(g_PLID, bootHooks);
+	g_pUtils->StartupServer(g_PLID, OnStartupServer);
+	if (g_bLateLoad)
+		OnStartupServer();
 
-	Msg("%s wiring events...\n", TAG);
-	g_pUtils->HookEvent(g_PLID, "player_team",         onTeamEvent);
-	g_pUtils->HookEvent(g_PLID, "player_death",        onDeath);
-	g_pUtils->HookEvent(g_PLID, "player_spawn",        wipeStaleMark);
-	g_pUtils->HookEvent(g_PLID, "round_prestart",      onRoundPrestart);
-	g_pUtils->HookEvent(g_PLID, "round_start",         onRoundStart);
-	g_pUtils->HookEvent(g_PLID, "player_connect_full", wireSlot);
-	g_pUtils->HookEvent(g_PLID, "player_disconnect",   unwireSlot);
+	g_pUtils->HookEvent(g_PLID, "player_team", OnPlayerTeam);
+	g_pUtils->HookEvent(g_PLID, "player_death", OnPlayerDeath);
+	g_pUtils->HookEvent(g_PLID, "player_spawn", OnPlayerSpawn);
+	g_pUtils->HookEvent(g_PLID, "round_prestart", OnRoundPrestart);
+	g_pUtils->HookEvent(g_PLID, "round_start", OnRoundStart);
+	g_pUtils->HookEvent(g_PLID, "player_connect_full", OnPlayerConnectFull);
+	g_pUtils->HookEvent(g_PLID, "player_disconnect", OnPlayerDisconnect);
 
-	g_pUtils->RegCommand(g_PLID, { "fab_reload" }, {}, reloadCmd);
+	g_pUtils->RegCommand(g_PLID, { "mm_fab_reload", "fab_reload" }, {}, OnReloadCommand);
 
-	Msg("%s ready!\n", TAG);
+	g_pCheckTimer = g_pUtils->CreateTimer(1.0f, CheckPlayers);
 }
 
-/////////////////////////////////////////////////////////////////
-const char *FastAutoBalance::GetLicense()
+const char* FastAutoBalance::GetLicense()
 {
 	return "Public";
 }
 
-const char *FastAutoBalance::GetVersion()
+const char* FastAutoBalance::GetVersion()
 {
-	return "2.3.0";
+	return "3.0";
 }
 
-const char *FastAutoBalance::GetDate()
+const char* FastAutoBalance::GetDate()
 {
 	return __DATE__;
 }
 
-const char *FastAutoBalance::GetLogTag()
+const char* FastAutoBalance::GetLogTag()
 {
 	return "[FAB]";
 }
 
-const char *FastAutoBalance::GetAuthor()
+const char* FastAutoBalance::GetAuthor()
 {
 	return "_ded_cookies";
 }
 
-const char *FastAutoBalance::GetDescription()
+const char* FastAutoBalance::GetDescription()
 {
 	return "Team Auto Balance";
 }
 
-const char *FastAutoBalance::GetName()
+const char* FastAutoBalance::GetName()
 {
 	return "FastAutoBalance";
 }
 
-const char *FastAutoBalance::GetURL()
+const char* FastAutoBalance::GetURL()
 {
 	return "https://api.onlypublic.net/";
 }

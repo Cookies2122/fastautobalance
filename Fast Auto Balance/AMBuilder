@@ -19,14 +19,10 @@ for sdk_target in MMSPlugin.sdk_targets:
     
     binary.compiler.cxxincludes += [
       os.path.join(builder.sourcePath, 'include'),
-      # УБРАЛИ SchemaEntity - там могут быть проблемы
-      # os.path.join(builder.sourcePath, 'SchemaEntity'),
     ]
 
     binary.sources += [
       'fastautobalance.cpp',
-      # УБРАЛИ schemasystem.cpp - может содержать GameEntitySystem
-      # os.path.join(builder.sourcePath, 'SchemaEntity', 'schemasystem.cpp'),
     ]
 
     if cxx.target.arch == 'x86':
